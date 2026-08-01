@@ -223,6 +223,8 @@ export class Hud {
   private pResults!: Path2D;
   private pSpeedo!: Path2D;
   private pSpdSlab!: Path2D;
+  private pCorner!: Path2D;
+  private pCornerField!: Path2D;
 
   private lapX = 0;
   private lapY = 0;
@@ -254,6 +256,14 @@ export class Hud {
   private resY = 0;
   private resW = 0;
   private resH = 0;
+  private cornX = 0;
+  private cornY = 0;
+  private cornW = 0;
+  private cornH = 0;
+  private cornFX = 0;
+  private cornFY = 0;
+  private cornFW = 0;
+  private cornFH = 0;
 
   // ---- minimap projection ------------------------------------------------
   private mapCourse: Course | null = null;
@@ -407,6 +417,23 @@ export class Hud {
     this.spdSlabW = 152 * S;
     this.spdSlabH = 84 * S;
     this.pSpdSlab = platePath(this.spdSlabW, this.spdSlabH, 61.3, 13 * S, 1.5 * S);
+
+    // ---- top centre: corner preview --------------------------------------
+    // Docked, not floating. The indicator used to be three loose chevrons in
+    // open sky: with nothing behind them they read as debris, and with no
+    // unlit slots there was no scale to read the lit ones against. It is now a
+    // plate in the same language as LAP and TIME, sharing their top margin, and
+    // it carries a full seven-slot scale that is always drawn.
+    this.cornW = Math.max(260 * S, Math.min(372 * S, w * 0.3));
+    this.cornH = 80 * S;
+    this.cornX = Math.round((w - this.cornW) * 0.5);
+    this.cornY = M;
+    this.pCorner = platePath(this.cornW, this.cornH, 34.6, ch * 0.8, j);
+    this.cornFX = 14 * S;
+    this.cornFY = 34 * S;
+    this.cornFW = this.cornW - 28 * S;
+    this.cornFH = this.cornH - this.cornFY - 13 * S;
+    this.pCornerField = platePath(this.cornFW, this.cornFH, 47.1, ch * 0.45, j * 0.55);
 
     // ---- results ----------------------------------------------------------
     this.resW = Math.min(780 * S, w - 72 * S);
@@ -1136,47 +1163,122 @@ export class Hud {
   //  CORNER PREVIEW
   // -------------------------------------------------------------------------
 
+  /**
+   * Corner preview. A docked instrument, not a free-floating glyph.
+   *
+   * Two things were wrong with the loose chevrons this replaces. First, they
+   * had no plate: three dark shapes in open sky read as render debris, because
+   * every other piece of information in this HUD is drawn on card and they were
+   * not. Second, they had no scale — the *number* of chevrons carried the
+   * severity, so you were being asked to read a bar chart with the empty part
+   * of the bar deleted. One chevron and three chevrons look the same when they
+   * are the only thing on screen.
+   *
+   * So: a paper plate on the top-centre margin line shared with LAP and the
+   * minimap, and inside it a permanent seven-slot scale — three slots left,
+   * a centre "straight ahead" pip, three slots right. Every slot is always
+   * drawn. Unlit slots are the scale; lit slots are the reading. Each rung has
+   * a fixed colour (accent → warn → hot) and a fixed size, so severity is
+   * legible from position, colour and area at once rather than from counting.
+   */
   private drawCornerHint(s: HudState) {
-    const hint = s.cornerHint;
-    const sev = Math.min(1, Math.abs(hint));
-    if (sev < 0.07) return;
-
     const g = this.g;
     const S = this.S;
+    const hint = s.cornerHint;
+    const sev = Math.min(1, Math.abs(hint));
     const dir = hint < 0 ? -1 : 1;
-    const count = sev < 0.34 ? 1 : sev < 0.66 ? 2 : 3;
-    const col = sev < 0.34 ? ACCENT : sev < 0.66 ? WARN : HOT;
 
-    const cx = this.w * 0.5;
-    const cy = 104 * S;
-    const spacing = 38 * S;
-    const size = 25 * S;
+    // Quantised on the same thresholds the old indicator used, so the feel of
+    // the readout is unchanged — only its legibility is.
+    const level = sev < 0.07 ? 0 : sev < 0.34 ? 1 : sev < 0.66 ? 2 : 3;
+    const rungCols = [ACCENT, WARN, HOT];
 
-    // Fade the whole indicator in with severity so a gentle kink does not shout.
-    const base = clamp01((sev - 0.07) / 0.2);
+    this.openPlate(this.pCorner, this.cornX, this.cornY, 0.01, PAPER, 3.4 * S);
 
-    for (let i = 0; i < count; i++) {
-      // Chevrons animate outward: the far one lights last, which reads as
-      // "the corner is over there" rather than as a blinking light.
-      const phase = this.clock * 6.5 - i * 0.75;
-      const a = base * (0.42 + 0.58 * Math.max(0, Math.sin(phase)));
-      const x = cx + dir * spacing * (i + 0.6);
-      g.save();
-      g.globalAlpha = a * this.dimAlpha;
-      g.beginPath();
-      g.moveTo(x - dir * size * 0.55, cy - size);
-      g.lineTo(x + dir * size * 0.55, cy);
-      g.lineTo(x - dir * size * 0.55, cy + size);
-      g.lineWidth = 13.5 * S;
-      g.lineJoin = 'round';
-      g.lineCap = 'round';
-      g.strokeStyle = INK;
-      g.stroke();
-      g.lineWidth = 7.5 * S;
-      g.strokeStyle = col;
-      g.stroke();
-      g.restore();
+    // ---- label row ---------------------------------------------------------
+    g.font = this.fLabel;
+    this.text('CORNER', 16 * S, 26 * S, 'left', 2.2 * S, INK);
+
+    // State chip, stamped exactly the way the BOOST chip is: severity name on a
+    // slab in the severity colour. Ink type on the three bright fills, paper
+    // type on the dark "clear" fill — both survive their own background.
+    const chip = level === 0 ? 'CLEAR' : level === 1 ? 'EASY' : level === 2 ? 'MED' : 'TIGHT';
+    const chipFill = level === 0 ? TRACK_SLATE : rungCols[level - 1];
+    const cw = 84 * S;
+    const chh = 25 * S;
+    const cx = this.cornW - 15 * S - cw;
+    const cy = 6 * S;
+    g.beginPath();
+    g.moveTo(cx + 4 * S, cy);
+    g.lineTo(cx + cw, cy + 1 * S);
+    g.lineTo(cx + cw - 4 * S, cy + chh);
+    g.lineTo(cx, cy + chh - 1 * S);
+    g.closePath();
+    g.fillStyle = chipFill;
+    g.fill();
+    g.lineWidth = 3.0 * S;
+    g.strokeStyle = INK;
+    g.lineJoin = 'miter';
+    g.stroke();
+    g.font = this.fMapLabel;
+    this.text(chip, cx + cw * 0.5, cy + chh * 0.66, 'center', 2.0 * S, level === 0 ? PAPER_SOLID : INK);
+
+    // ---- the scale ---------------------------------------------------------
+    // A dark field, like the minimap's: the lit rungs are bright, and bright on
+    // paper would have to be outlined to survive. Bright on ink does not.
+    g.save();
+    g.translate(this.cornFX, this.cornFY);
+    g.fillStyle = INK_FIELD;
+    g.fill(this.pCornerField);
+    g.lineWidth = 2.6 * S;
+    g.strokeStyle = INK;
+    g.stroke(this.pCornerField);
+
+    const midX = this.cornFW * 0.5;
+    const midY = this.cornFH * 0.5;
+    // Seven columns across the field, with a half-column of air at each end.
+    const slot = this.cornFW / 7.6;
+
+    // Centre pip: the zero of the scale. Without it the two wings are just two
+    // rows of arrows and there is nothing marking "straight".
+    g.beginPath();
+    g.moveTo(midX, midY - 5.5 * S);
+    g.lineTo(midX + 4.5 * S, midY);
+    g.lineTo(midX, midY + 5.5 * S);
+    g.lineTo(midX - 4.5 * S, midY);
+    g.closePath();
+    g.fillStyle = level === 0 ? PAPER_SOLID : TRACK_SLATE;
+    g.fill();
+
+    for (let side = -1; side <= 1; side += 2) {
+      for (let k = 1; k <= 3; k++) {
+        const on = side === dir && k <= level;
+        // Rungs grow outward, so the reading has area as well as count.
+        const hw = slot * 0.24;
+        const hh = (7.0 + 1.9 * k) * S;
+        const x = midX + side * slot * k;
+
+        // The outward chase is kept from the old indicator: the far rung lights
+        // last, which reads as "the corner is over there" and not as a blink.
+        let a = 1;
+        if (on) a = 0.55 + 0.45 * Math.max(0, Math.sin(this.clock * 6.5 - k * 0.75));
+        g.save();
+        g.globalAlpha = (on ? a : 1) * this.dimAlpha;
+        g.beginPath();
+        g.moveTo(x - side * hw, midY - hh);
+        g.lineTo(x + side * hw, midY);
+        g.lineTo(x - side * hw, midY + hh);
+        g.lineWidth = (on ? 6.2 : 4.4) * S;
+        g.lineJoin = 'round';
+        g.lineCap = 'round';
+        g.strokeStyle = on ? rungCols[k - 1] : TRACK_SLATE;
+        g.stroke();
+        g.restore();
+      }
     }
+    g.restore();
+
+    this.closePlate();
   }
 
   // -------------------------------------------------------------------------

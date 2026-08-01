@@ -69,6 +69,25 @@ import {
  *  exactly. That is how the racing stripe gets a clean diagonal break instead
  *  of a staircase at station resolution.
  *
+ *  IDEA 3 — THE RIDER IS THE SUBJECT, THE CRAFT IS THE PROP
+ *  --------------------------------------------------------
+ *  Every vertical dimension here is budgeted against the rider, not against a
+ *  boat. The saddle top (0.80) is the datum; the console crown sits BELOW it
+ *  (0.78 peak, 0.60 at the end nearest the rider), the deck edge sits 0.47 m
+ *  below it, and the handlebar is one hand's reach above it (1.00). Only the
+ *  dorsal fin is allowed to break the rider's shoulder line, because a lean
+ *  machine still needs one vertical to read against the horizon.
+ *
+ *  The earlier lines were a runabout's: 0.37 m of freeboard amidships rising to
+ *  0.69 at the stem, with a 1.08 m console standing 0.33 m proud of the saddle.
+ *  From any camera below the rider's shoulders that stack cut them off at
+ *  mid-chest. Freeboard is now 0.16 / 0.265 / 0.46 and the console is 0.78, so
+ *  torso, arms and thighs are all on the sky side of the deck line.
+ *
+ *  Length (4.60) and beam (1.50) are UNCHANGED, and so are the bottom, the
+ *  chine, the spray rail and the stem rake — Boat.ts samples buoyancy against
+ *  those and only those. Everything that moved is above the waterline.
+ *
  *  Local frame: bow at +Z, +Y up, origin at the waterline on the centreline.
  *  Length 4.60 m, beam 1.50 m, so this matches the buoyancy sample points in
  *  Boat.ts one-for-one — the two files are tuned against the same numbers, and
@@ -444,9 +463,25 @@ function chineYAt(u: number): number {
   return -0.175 - 0.05 * Math.sin(Math.PI * Math.min(1, u / 0.7)) + 0.5 * rise * rise;
 }
 
-/** Sheer (gunwale) line. Rises 0.47 m to the bow — the single biggest reason the
- *  profile reads forward-leaning rather than like a slipper. */
-const sheerYAt = (u: number) => 0.22 + 0.47 * u * u + 0.03 * Math.sin(u * Math.PI);
+/**
+ * Sheer (gunwale) line — the deck edge, and the single number that decides
+ * whether this reads as a hydrofoil or as a runabout.
+ *
+ * FREEBOARD. The boat floats with its origin on the waterline (Boat.ts settles
+ * at ~0.23 m of draft against sample depths of −0.22), so `sheerYAt` IS the
+ * freeboard in metres. It used to be 0.22 aft / 0.37 amidships / 0.69 at the
+ * stem, which put 0.38 m of unbroken topside above the water at the bow — taller
+ * than the rider's torso and the reason the rider read as a head peeking over a
+ * gunwale. It is now 0.16 / 0.265 / 0.46: a third off everywhere, and half off
+ * the forward flank, because the forward flank is what the chase and rider
+ * cameras actually see.
+ *
+ * The u² term is kept (the bow still rises 0.30 m over the stern, so the profile
+ * still leans forward) but the constant and the coefficient both come down. Do
+ * not take the constant below ~0.14: the aft deck carries the saddle base, the
+ * footwell trays and the stern module, and all three have to stay buried in it.
+ */
+const sheerYAt = (u: number) => 0.16 + 0.3 * u * u + 0.03 * Math.sin(u * Math.PI);
 
 /**
  * Stem rake: how far aft the lower points are dragged. 0.70 m at the forefoot,
@@ -590,25 +625,45 @@ function topsideAO(_u: number, v: number): number {
 //  Superstructure: cowling, intakes, screen, bars, seat, stern module
 // ---------------------------------------------------------------------------
 
-const COWL_Z0 = -0.18;
+/**
+ * The console ends where the saddle begins (z = 0.02) instead of running 0.20 m
+ * back UNDER the rider. That overlap was half the occlusion problem: the cowl
+ * skin was standing between the camera and the rider's thighs at exactly the
+ * station the thighs occupy.
+ */
+const COWL_Z0 = 0.02;
 const COWL_Z1 = 1.66;
 /** Superellipse exponent. 0.62 is flat enough on top to hold one ramp band and
  *  sharp enough at the shoulder for the Sobel pass to find it. A circular arch
  *  (exponent 1) smears the terminator all the way round. */
 const SE_P = 0.62;
 
-/** Cowling ridge height. Peaks at u = 0.40, just ahead of the rider's hands,
- *  and rakes down to a chisel nose. 1.08 m — 10 cm taller than the old cowl. */
+/**
+ * Cowling ridge height. Peaks at u = 0.40 (z = 0.68, just ahead of the rider's
+ * hands) and rakes down to a chisel nose that dies into the foredeck.
+ *
+ * 0.78 m, down from 1.08. The old crown stood 0.33 m ABOVE the saddle, so from
+ * any camera lower than the rider's shoulders the console cut the rider off at
+ * mid-chest. At 0.78 the crown is 0.02 m *below* the saddle top and 0.14 m below
+ * the hip: the whole torso, both arms and both thighs are now on the sky side of
+ * it. The aft drop is deepened (0.18) so the end nearest the rider, at 0.60, is
+ * the lowest part of the console rather than merely 0.15 down from the peak.
+ */
 function cowlTop(u: number): number {
   return (
-    1.08 -
-    0.33 * Math.pow(Math.max(0, (u - 0.4) / 0.6), 1.3) -
-    0.15 * Math.pow(Math.max(0, (0.4 - u) / 0.4), 1.5)
+    0.78 -
+    0.3 * Math.pow(Math.max(0, (u - 0.4) / 0.6), 1.3) -
+    0.18 * Math.pow(Math.max(0, (0.4 - u) / 0.4), 1.5)
   );
 }
-const cowlHalf = (u: number) => 0.44 - 0.3 * Math.pow(Math.max(0, (u - 0.26) / 0.74), 1.45);
-/** Base line, sunk into the deck camber so no gap can ever show. */
-const cowlBase = (u: number) => 0.28 + 0.22 * u;
+/** Half-width: 0.34, from 0.44. The rider's knees splay to about ±0.25, so a
+ *  0.44 console had them inside its shell; 0.34 lets the thighs clear its
+ *  shoulder and read against the water. */
+const cowlHalf = (u: number) => 0.34 - 0.24 * Math.pow(Math.max(0, (u - 0.26) / 0.74), 1.45);
+/** Base line, sunk into the deck camber so no gap can ever show. Tracks the
+ *  lowered sheer: deck-at-centreline runs 0.35 (aft) to 0.47 (nose), and this
+ *  runs 0.16 to 0.36, so the skirt stays buried the whole length. */
+const cowlBase = (u: number) => 0.16 + 0.2 * u;
 
 function cowlPoint(u: number, v: number, out: Vector3): Vector3 {
   const a = (v * 2 - 1) * (Math.PI / 2);
@@ -660,8 +715,10 @@ function cowlTint(u: number, v: number): number {
 const REAR_Z0 = -0.9;
 const REAR_Z1 = -2.28;
 const rearHalf = (u: number) => 0.31 + 0.08 * Math.sin(Math.PI * clamp01(u * 1.1)) - 0.09 * u;
-const rearTop = (u: number) => 0.42 + 0.2 * Math.sin(Math.PI * clamp01((u + 0.15) / 1.3));
-const REAR_BASE = 0.2;
+/** Dropped with the deck: the aft deck is now 0.245..0.30 at the centreline, so
+ *  a 0.62 m crown back here would have out-topped the console in front of it. */
+const rearTop = (u: number) => 0.34 + 0.17 * Math.sin(Math.PI * clamp01((u + 0.15) / 1.3));
+const REAR_BASE = 0.13;
 
 function rearPoint(u: number, v: number, out: Vector3): Vector3 {
   const a = (v * 2 - 1) * (Math.PI / 2);
@@ -786,7 +843,11 @@ function screenPoint(u: number, v: number, out: Vector3): Vector3 {
   const z = 1.26 - 0.17 * u - 0.11 * e * e;
   const cu = clamp01((z - COWL_Z0) / (COWL_Z1 - COWL_Z0));
   const y0 = cowlYAt(cu, x) - 0.02;
-  return out.set(x, y0 + u * (0.34 - 0.1 * e * e), z);
+  // Screen height scaled with the console it sits on (0.19, was 0.34): at the
+  // old height it topped out above the handlebar and put a translucent panel
+  // across the rider's arms, and even at 0.24 it stood taller than the saddle
+  // and read as a shard rather than a deflector.
+  return out.set(x, y0 + u * (0.19 - 0.06 * e * e), z);
 }
 
 /** Round tube swept along a path. Used for the handlebar and the jet nozzle. */
@@ -814,23 +875,47 @@ function tubeGeo(
   );
 }
 
-// Handlebar path. Swept back at the ends (a straight bar looks like a broomstick)
-// and lifted to clear the taller cowl — the grips sit 9 cm above the crown.
+// Handlebar path. Swept back at the ends (a straight bar looks like a broomstick).
+// Down from 1.20 to 1.00 with the console: the bar has to stay a hand's reach
+// above the saddle (0.80), not a shoulder's. At 1.00 the grips are 0.43 m clear
+// of the cowl crown, so the whole forearm is drawn against sky and water instead
+// of disappearing into the fairing.
 const BAR_HALF = 0.35;
 const barX = (s: number) => (s * 2 - 1) * BAR_HALF;
-const barY = (s: number) => 1.2 + 0.02 * (s * 2 - 1) * (s * 2 - 1);
-const barZ = (s: number) => 0.52 - 0.1 * (s * 2 - 1) * (s * 2 - 1);
+const barY = (s: number) => 1.0 + 0.02 * (s * 2 - 1) * (s * 2 - 1);
+const barZ = (s: number) => 0.5 - 0.1 * (s * 2 - 1) * (s * 2 - 1);
 /** Grips start at 65% of the half-span; fatter, so the hands have something to sit on. */
 const barR = (s: number) => (Math.abs(s * 2 - 1) > 0.65 ? 0.042 : 0.026);
 
-/** Seat pad: lofted rounded pedestal from the tail of the cowling to the fin. */
+/**
+ * Saddle: a lofted rounded pedestal butting against the back of the console and
+ * running aft toward the stern module.
+ *
+ * PERCH. Contact patch up from 0.75 to 0.80 while the deck under it came down
+ * from 0.43 to 0.33, so the saddle now stands 0.47 m proud of the deck instead
+ * of 0.32 — a 45% taller pedestal. That is what puts the rider's mass visibly
+ * ON the craft rather than down inside it.
+ *
+ * MASS. Because it is that much more exposed it also has to be that much
+ * smaller, or it becomes the largest object in the frame. The first pass kept
+ * the old 1.30 m length and 0.235 m half-beam on the new pedestal height and
+ * rendered as a black beanbag bigger than the rider sitting on it. It is now
+ * 1.11 m long, 0.215 m at its widest, and — see `seatTint` — split into a dark
+ * pad on a bodywork-coloured plinth instead of being one navy lump the same
+ * value as the rider's suit.
+ *
+ * The base stays at 0.26 so the skirt is buried at every station: the deck
+ * under the saddle's own outboard edge runs 0.28 aft to 0.33 forward.
+ */
+const SEAT_Z0 = -1.05;
+const SEAT_Z1 = 0.06;
 function seatPoint(u: number, v: number, out: Vector3): Vector3 {
-  const z = lerp(-1.2, 0.1, u);
+  const z = lerp(SEAT_Z0, SEAT_Z1, u);
   // Top line dips in the middle (that dip is what a saddle *is*) and kicks up
   // at the back so the rider is not going to slide off under boost.
-  const top = 0.775 - 0.075 * Math.sin(Math.PI * Math.min(1, u / 0.85)) + 0.035 * (1 - u);
-  const hw = 0.16 + 0.075 * Math.sin(Math.PI * clamp01((u + 0.1) / 1.1));
-  const base = 0.4;
+  const top = 0.825 - 0.075 * Math.sin(Math.PI * Math.min(1, u / 0.85)) + 0.035 * (1 - u);
+  const hw = 0.15 + 0.065 * Math.sin(Math.PI * clamp01((u + 0.1) / 1.1));
+  const base = 0.26;
   const a = (v * 2 - 1) * (Math.PI / 2);
   const s = Math.sin(a);
   const c = Math.max(0, Math.cos(a));
@@ -841,10 +926,29 @@ function seatPoint(u: number, v: number, out: Vector3): Vector3 {
   );
 }
 
+/**
+ * Saddle livery. v = 0.5 is the crown and v -> 0/1 are the bottom edges, so
+ * |v − 0.5| is "distance down the flank". Everything above 0.36 of that — which
+ * the 0.55 superellipse puts at roughly the top 38% of the section height — is
+ * the ink pad; everything below is the racer's dark, i.e. bodywork.
+ *
+ * This split is not decoration. The rider's suit is a mid-slate navy and the
+ * old saddle was PAL.suit, so seat and rider were the same value and the two
+ * merged into one silhouette exactly where the pose needs to read. Ink under
+ * navy separates them; racer-dark under ink puts the plinth back on the boat.
+ *
+ * 0.09 is just over one row of the 13-row section, which is the minimum width
+ * `edgeSlot` needs to resolve the contour instead of saturating both ends.
+ */
+function seatTint(_u: number, v: number): number {
+  return edgeSlot(0.36 - Math.abs(v - 0.5), S_DARK, S_INK, 0.09);
+}
+const seatAO = (_u: number, v: number) => (Math.abs(v - 0.5) > 0.36 ? 0.5 : 0.95);
+
 /** Stern jet nozzle: flared outer cone, inner cone, black throat disc. 20% wider
  *  than the old one and pushed 8 cm further aft so it clears the transom and
  *  actually reads from a chase camera. */
-const NOZZLE_Y = 0.21;
+const NOZZLE_Y = 0.17;
 function nozzleGeo(): BufferGeometry {
   const outer = tubeGeo(
     3,
@@ -896,7 +1000,11 @@ function nozzleStrutGeo(): BufferGeometry {
 /** Tail fin: a swept dorsal with a raked leading edge, running 1.25 m along the
  *  stern module. Convex so the cap fans stay well-formed. */
 const FIN_Z0 = -2.2;
-const FIN_Y0 = 0.3;
+/** Root dropped with the stern module so it still emerges from the cowl rather
+ *  than floating above it. The fin is deliberately the ONE tall element left in
+ *  the silhouette — everything else came down, and a lean machine still needs a
+ *  vertical to read against the horizon. */
+const FIN_Y0 = 0.24;
 function finGeo(): BufferGeometry {
   const g = extrudeXY(
     [
@@ -1030,7 +1138,11 @@ function numberMaterial(tex: CanvasTexture): ShaderMaterial {
  */
 function numberPanelGeo(side: number): BufferGeometry {
   const UF = 0.53; // forward end
-  const UA = 0.23; // aft end
+  // Aft end pulled forward 0.06 (0.28 m). The topside patch this rides on lost
+  // ~0.09 m of height when the sheer came down, so the panel had to lose the
+  // matching amount of length or the numeral would have stretched from 5:1 to
+  // better than 6:1 and read as a smear.
+  const UA = 0.29; // aft end
   return gridPatch(
     6,
     5,
@@ -1130,10 +1242,23 @@ function flameMaterial(tint: Color): ShaderMaterial {
 /** Where the rider's hands go. Sampled from the bar path, never hand-typed. */
 const GRIP_E = 0.853; // fraction of the half-span at which the grips sit
 const GRIP_X = BAR_HALF * GRIP_E;
-const GRIP_Y = 1.2 + 0.02 * GRIP_E * GRIP_E;
-const GRIP_Z = 0.52 - 0.1 * GRIP_E * GRIP_E;
-/** Saddle contact patch, sampled from `seatPoint` at u = 0.72. */
-const SEAT_Y = 0.75;
+const GRIP_Y = 1.0 + 0.02 * GRIP_E * GRIP_E;
+const GRIP_Z = 0.5 - 0.1 * GRIP_E * GRIP_E;
+/**
+ * Saddle contact patch, sampled from `seatPoint` at u = 0.72 — NOT typed in.
+ * Saddle contact patch, sampled from `seatPoint` at u = 0.712 — NOT typed in.
+ * lerp(SEAT_Z0, SEAT_Z1, 0.712) = −1.05 + 1.11·0.712 = −0.260 in z, and
+ * seatPoint's top line there = 0.825 − 0.075·sin(π·0.837) + 0.035·0.288
+ *                            = 0.825 − 0.0367 + 0.0101 = 0.798 in y.
+ *
+ * This is the published mount `Rider.ts` re-seats on (`root.userData.seat`), so
+ * moving the saddle without moving this leaves the rider floating or sunk. The
+ * grips moved with the bar in the same edit for the same reason. Held to +0.05
+ * rather than more: Rider.ts IKs the legs to a footwell fallback at y = 0.345
+ * and thigh + shin is only 0.82 m, so lifting the hips much further than this
+ * straightens the legs out of their crouch.
+ */
+const SEAT_Y = 0.8;
 const SEAT_Z = -0.26;
 
 export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts } {
@@ -1185,10 +1310,15 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
 
   for (const side of [1, -1]) {
     // Footwells: recessed trays outboard of the saddle where the rider's feet
-    // land, with a rim standing proud of the deck.
-    const tray = place(trayGeo(0.34, 0.13, 0.9), side * 0.48, 0.24, -0.8);
+    // land. Shallower (0.09, was 0.13) and lifted, because the deck they are cut
+    // into came down ~0.10: a 0.13 well would now have its rim standing a hand's
+    // width proud of the gunwale, and trayGeo's walls face inward so a proud rim
+    // shows its own backfaces. Rim lands at 0.29 against a deck of 0.26..0.31.
+    // Moved forward to z = −0.55 so the well brackets Rider.ts's foot mount at
+    // z = −0.30 instead of sitting behind it.
+    const tray = place(trayGeo(0.34, 0.09, 0.9), side * 0.46, 0.17, -0.55);
     paintTint(tray, () => S_INK);
-    paintAO(tray, (_x, y) => (y < 0.28 ? 0.1 : 0.34));
+    paintAO(tray, (_x, y) => (y < 0.22 ? 0.1 : 0.34));
     patches.push(tray);
   }
 
@@ -1251,6 +1381,11 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
       proud: 0.055,
       na: 6,
     }),
+    // The saddle rides with the BODY, not with the bars: it is moulded
+    // furniture in the racer's own colours, and putting it on the two-colour
+    // gear material (PAL.suit / PAL.inkSoft, both dark) is what made it read as
+    // one navy blob continuous with the rider sitting on it.
+    paintUV(gridPatch(12, 13, seatPoint), seatTint, seatAO),
     paintConst(finGeo(), S_DARK, 0.9),
     nozzleGeo(),
     nozzleStrutGeo(),
@@ -1304,19 +1439,19 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   const barGeo = tubeGeo(26, 8, (s, o) => o.set(barX(s), barY(s), barZ(s)), barR, 'x');
   const stem = extrudeXY(
     [
-      [-0.06, 0],
-      [0.06, 0],
-      [0.045, 0.18],
-      [-0.045, 0.18],
+      [-0.065, 0],
+      [0.065, 0],
+      [0.045, 0.29],
+      [-0.045, 0.29],
     ],
     0.1
   );
-  place(stem, 0, 1.05, GRIP_Z + 0.04);
-  const gearGeo = mergeSoup([
-    paintConst(gridPatch(12, 13, seatPoint), 0, 0.8),
-    paintConst(barGeo, 1, 0.95),
-    paintConst(stem, 1, 0.7),
-  ]);
+  // The crown of the console at the stem's station is 0.748, so the riser has to
+  // start there and run the full 0.28 up to the bar — with the bars down at 1.00
+  // the post is now a visible piece of the machine rather than a 0.02 m stub.
+  place(stem, 0, 0.72, GRIP_Z + 0.04);
+  // Bars and riser only — the saddle moved to `bodyGeo`.
+  const gearGeo = mergeSoup([paintConst(barGeo, 1, 0.95), paintConst(stem, 1, 0.7)]);
   ensureCelAttributes(gearGeo);
   const gear = new Mesh(
     gearGeo,
@@ -1340,8 +1475,11 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   const px = 0.04; // fin half-thickness (0.0375) + 2.5 mm standoff
   const z0 = -1.98;
   const z1 = -1.45;
-  const y0 = 0.44;
-  const y1 = 0.94;
+  // Shifted down 0.06 with FIN_Y0. The fin's upper edge over z = −1.98..−1.45
+  // runs 1.06 down to 0.94 in world y, so 0.88 is the highest the plate can go
+  // without hanging off the trailing edge.
+  const y0 = 0.38;
+  const y1 = 0.88;
   const V = (a: number, b: number, c: number) => new Vector3(a, b, c);
   const plates = mergeSoup([
     // starboard: u must increase toward the stern to read left-to-right
@@ -1388,7 +1526,7 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   // draw-call budget; BoatParts types them as Object3D precisely so they can be
   // attachment points. Nine draw calls per boat including the three ink shells.
   const nose = new Object3D();
-  nose.position.set(0, 0.66, COWL_Z1);
+  nose.position.set(0, 0.46, COWL_Z1);
   const engine = new Object3D();
   engine.position.set(0, NOZZLE_Y, -2.2);
   const fin = new Object3D();
@@ -1403,6 +1541,16 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   root.userData.gripL = new Vector3(GRIP_X, GRIP_Y, GRIP_Z);
   root.userData.gripR = new Vector3(-GRIP_X, GRIP_Y, GRIP_Z);
   root.userData.seat = new Vector3(0, SEAT_Y, SEAT_Z);
+  // Rider.ts already looks for `footL`/`footR` and falls back to (±0.44, 0.345,
+  // −0.30) when they are missing — numbers measured off the OLD footwells. The
+  // wells moved (outboard to ±0.46, forward to z = −0.55, floor down to 0.20)
+  // when the deck came down, so publish where they actually are now. Slightly
+  // wider than the well centre on purpose: splaying the knees outboard of the
+  // gunwale is what puts the thighs against water and sky instead of against
+  // the hull's own shadow. Hip-to-foot works out at 0.74 m against a 0.82 m
+  // thigh + shin, so the crouch survives — do not push these much further out.
+  root.userData.footL = new Vector3(0.5, 0.33, -0.28);
+  root.userData.footR = new Vector3(-0.5, 0.33, -0.28);
   root.userData.flame = flame;
 
   return { root, parts: { hull, nose, engine, fin, seat } };

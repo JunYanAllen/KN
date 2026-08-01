@@ -38,19 +38,48 @@ import { sampleHeight } from '../water/Gerstner';
 /** Speed used to normalise everything. Boats top out at ~46 m/s on boost. */
 const REF_SPEED = 42;
 
-/** Chase anchor, at rest and at full chat. */
-const CHASE_BACK_SLOW = 8.6;
-const CHASE_BACK_FAST = 11.9;
+/**
+ * Chase anchor, at rest and at full chat.
+ *
+ * These were 8.6 → 11.9 m back and 4.15 → 2.45 m up, and at those numbers the
+ * craft was a small object low in the frame: with a 4 m hull 12 m away under a
+ * 60° lens it covered about a twentieth of the picture height, which put the
+ * minimap and the speedometer — both large, both high contrast, both parked in
+ * corners — in charge of the composition. There was no subject.
+ *
+ * The rig now sits roughly a hull-and-a-half behind the transom and barely
+ * above the rider's head. Two things follow from that and both are wanted.
+ * Foreshortening: at 7 m the near quarter of the hull is visibly bigger than
+ * the far quarter, so the boat has volume instead of reading as a decal. And
+ * parallax: the crest the camera is crossing sweeps through frame far faster
+ * than the horizon does, which is where the sense of speed actually comes from
+ * — not from FOV, which only widens what is already slow.
+ */
+const CHASE_BACK_SLOW = 6.3;
+const CHASE_BACK_FAST = 8.6;
 /** Height above the boat. Drops at speed so the water rips past underneath. */
-const CHASE_UP_SLOW = 4.15;
-const CHASE_UP_FAST = 2.45;
+const CHASE_UP_SLOW = 2.55;
+const CHASE_UP_FAST = 1.75;
 /** Extra height while airborne so a big jump reads as height, not as a cut. */
-const CHASE_UP_AIR = 1.5;
+const CHASE_UP_AIR = 0.8;
 
-/** How far ahead of the bow the look-at point sits, at rest and at speed. */
-const LOOK_AHEAD_SLOW = 4.0;
-const LOOK_AHEAD_FAST = 13.0;
-const LOOK_UP = 1.55;
+/**
+ * How far ahead of the bow the look-at point sits, at rest and at speed.
+ *
+ * Shortened along with the anchor. Look-ahead and camera distance trade against
+ * each other for where the boat lands in frame: pulling the camera in without
+ * pulling the aim in would just have slid the craft out of the bottom of the
+ * picture, which is the framing failure this change exists to fix. At 9.5 m the
+ * next gate is still comfortably in shot on the approach to a corner.
+ */
+const LOOK_AHEAD_SLOW = 3.4;
+const LOOK_AHEAD_FAST = 9.5;
+/**
+ * Aim height above the boat. Lowered with the rig: the aim wants to be near the
+ * rider's shoulders, and with the camera itself only ~2.5 m up an aim at 1.55 m
+ * tilts the lens down harder than it needs to and buries the horizon.
+ */
+const LOOK_UP = 1.3;
 
 /** Slow spring on the body, fast spring on the aim. See the header. */
 const POS_OMEGA = 4.6;
@@ -101,8 +130,30 @@ const LOOK_OMEGA_Y = 3.0;
  * bigger — which can only be a real jump — gets tracked properly. No state, no
  * blending, and it cannot get stuck in the wrong mode.
  */
-const LOOK_STIFF_FROM = 3.0; // m of aim error before stiffening begins
-const LOOK_STIFF_TO = 7.0; // m of aim error at which it is fully stiff
+/*
+ * These thresholds are in METRES of aim error, but what actually matters is the
+ * ANGLE that error subtends, and the angle is the error divided by the camera
+ * distance. Pulling the anchor in from 11.7 m to 8.1 m therefore made every
+ * threshold here 45% too lax overnight: the same 4 m of heave that used to
+ * drop the boat 19° down the frame now drops it 26°, and measured over a full
+ * three-lap run the tenth-percentile boat position went from y = −0.78 NDC to
+ * −1.00 — i.e. one frame in ten had the subject on or past the bottom edge.
+ *
+ * So the ramp starts earlier and completes sooner, by roughly the same ratio
+ * the distance shrank. This deliberately does NOT touch the *body* springs,
+ * which are the anti-nausea mechanism: the camera still holds its line through
+ * the swell and the horizon still does not translate. Only the aim comes down
+ * with the boat, and only once the boat is far enough out of the middle of the
+ * frame that keeping it is worth a few degrees of pitch.
+ */
+const LOOK_STIFF_FROM = 1.2; // m of aim error before stiffening begins
+const LOOK_STIFF_TO = 4.0; // m of aim error at which it is fully stiff
+/*
+ * The body thresholds are deliberately left where they were. This is the spring
+ * that decides whether the horizon translates, and moving it in was measured to
+ * make the framing very slightly *worse* rather than better — the body coming
+ * down faster just means it meets the next crest sooner and gets pushed back up.
+ */
 const POS_STIFF_FROM = 4.0;
 const POS_STIFF_TO = 9.5;
 
@@ -133,7 +184,13 @@ const ORBIT_POS_OMEGA = 7.5;
  * velocity would make the camera copy the boat's bob over every swell, which is
  * precisely what the vertical spring exists to remove.
  */
-const POS_LEAD = 0.85;
+/**
+ * Raised from 0.85 when the anchor came in. The uncancelled remainder is
+ * 2·v·(1−POS_LEAD)/ω, which at top speed was 2.7 m — tolerable stretch on a
+ * 12 m shot, a third of the whole shot on a 8.6 m one. 0.93 leaves ~1.2 m,
+ * which is still enough that hard acceleration visibly pushes the camera back.
+ */
+const POS_LEAD = 0.93;
 const LOOK_LEAD = 1.0;
 
 /** Lateral trail through a corner, in metres per rad/s of yaw rate. */
@@ -166,8 +223,20 @@ const TRAUMA_DECAY = 1.45;
 const SHAKE_POS = 0.5; // metres at full trauma
 const SHAKE_ROT = 0.05; // radians at full trauma
 
-/** Never let the eye go under. 1.1 m of clearance over the local wave height. */
-const WATER_CLEARANCE = 1.1;
+/**
+ * Never let the eye go under.
+ *
+ * Raised from 1.1 m when the rig came down. Clearance is measured against the
+ * wave height at the camera's own xz, but the lens sees the surface all around
+ * it, and a Gerstner crest a metre to the side stands well above the point
+ * directly underneath. At 1.1 m the low rig spent 12% of a three-lap run inside
+ * half a metre of the water and one captured frame had the surface cutting
+ * across the bottom corner of the picture — the eye was technically dry and
+ * visibly not. 1.7 m puts that back down to the level the old high rig ran at
+ * without giving back the height the shot was pulled down to gain, because this
+ * floor only applies over crests: in a trough the anchor is still the boat.
+ */
+const WATER_CLEARANCE = 1.7;
 
 export type CamMode = 'chase' | 'orbit' | 'results';
 
@@ -344,8 +413,8 @@ export class CameraRig {
       _lookGoal.y += LOOK_UP;
       // Under boost the aim pulls further ahead and slightly down: the frame
       // commits to where you are going and the water gets closer to the lens.
-      _lookGoal.addScaledVector(_fwd, boost * 4.5);
-      _lookGoal.y -= boost * 0.6;
+      _lookGoal.addScaledVector(_fwd, boost * 3.2);
+      _lookGoal.y -= boost * 0.45;
 
       fovGoal = FOV_BASE + (FOV_MAX - FOV_BASE) * Math.min(1, speed01 * speed01 * 0.75 + boost * 0.6);
     } else {
@@ -391,7 +460,23 @@ export class CameraRig {
     // Sampled under the *desired* position, because the camera can easily be on
     // a crest while the boat sits in the trough behind it.
     const floorY = sampleHeight(_desired.x, _desired.z, t) + WATER_CLEARANCE;
-    if (_desired.y < floorY) _desired.y = floorY;
+    if (_desired.y < floorY) {
+      const lift = floorY - _desired.y;
+      _desired.y = floorY;
+      // ...and carry the AIM up with it. This is new, and it is the difference
+      // between crest avoidance being invisible and crest avoidance being the
+      // thing that throws the boat out of the bottom of the frame.
+      //
+      // With the camera d ≈ 8 m behind the boat and the aim a ≈ 17 m in front
+      // of the lens, raising the eye by L pushes the boat down the frame by
+      // L·(1/d − 1/a) rad while raising the aim by L pulls it back up by L/a.
+      // One lift therefore cancels about four fifths of the other, and 0.8 of
+      // it is close enough that a crest passing under the rig reads as the
+      // camera rising over a wave rather than as the boat sinking. The clamp
+      // itself is untouched: the eye still never gets closer than
+      // WATER_CLEARANCE to the surface it is over.
+      if (this.mode === 'chase') _lookGoal.y += lift * 0.8;
+    }
 
     // ---- first frame: snap, do not sweep in from the origin ---------------
     if (!this.initialised) {
@@ -424,7 +509,7 @@ export class CameraRig {
     // only fires if a wave rises into the camera faster than the spring can
     // climb, and it is deliberately much tighter than WATER_CLEARANCE so that
     // it stays a rarity rather than becoming the thing that drives the shot.
-    const hardFloor = sampleHeight(this.pos.x, this.pos.z, t) + 0.35;
+    const hardFloor = sampleHeight(this.pos.x, this.pos.z, t) + 0.75;
     if (this.pos.y < hardFloor) {
       this.pos.y = hardFloor;
       if (this.posVel.y < 0) this.posVel.y = 0;

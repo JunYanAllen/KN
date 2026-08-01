@@ -70,9 +70,24 @@ import { sampleHeight, WAVE_MAX_HEIGHT } from './Gerstner';
  *
  *  ── 2. THE SPRAY ──────────────────────────────────────────────────────────
  *  One InstancedMesh, one draw call, a fixed pool, zero allocation per emit.
- *  The sprites are not soft round puffs: each one is a hard-thresholded
- *  three-lobe metaball whose lobe layout is picked by a per-particle seed, with
- *  an ink band along its underside. They read as painted splash shapes.
+ *
+ *  The drawing rule here is that the MASS carries the silhouette, never the
+ *  individual sprite. Round-2 got that backwards: ~450 particles up to 4 m
+ *  across, each a radial metaball ringed with ink, so every one of them was
+ *  separately legible and the frame filled with floating eggs. The rewrite
+ *  inverts all three of those:
+ *
+ *    • many more, much smaller  — 1700 slots, 0.10–0.65 m instead of 0.35–4.3 m
+ *    • torn and directional     — an irregular polygon (straight edges, hard
+ *      corners) pinched into a tail, oriented and stretched along the sprite's
+ *      screen-space velocity, so a burst reads as a spray of flicks
+ *    • no outline               — ink only on the lower edge, and only on the
+ *      largest near sprites; the mass edge does the drawing
+ *
+ *  They also have to belong to the water: the launch speeds are low, gravity is
+ *  exaggerated and drag is high, so the ballistic arc lands back on the surface
+ *  well inside the particle's lifetime. A particle that ages out in mid-air is
+ *  a bug, not a look.
  */
 
 // ---------------------------------------------------------------------------
@@ -131,18 +146,36 @@ const ARM_GAIN = 0.7;
 const ARM_TAPER_MEAN = 0.675;
 
 const MAX_STAMP_QUADS = 256;
-const MAX_DEATH_STAMPS = 48;
+/** Landing spray marks stamped into the ribbon per frame. Deliberately well
+ *  below the number of particles that now reach the water each frame: the
+ *  stamps are additive against a 6 s decay, so an uncapped stream of them
+ *  saturates a solid white patch behind every boat within a second. */
+const MAX_DEATH_STAMPS = 24;
 
-const MAX_PARTICLES = 448;
-/** Particles further than this from the focus point are retired. */
-const SPRAY_CULL = 230;
+/**
+ * Pool size. The sprites are small enough now that a burst only reads as spray
+ * if there are a hundred-odd of them, and four boats at speed hold roughly
+ * 400 continuous particles between them, so 448 (the round-2 figure) would be
+ * exhausted inside one splash and the round-robin recycler would start eating
+ * live particles mid-flight.
+ */
+const MAX_PARTICLES = 1700;
+/** Particles further than this from the focus point are retired. A 0.3 m flick
+ *  is under two pixels past ~150 m, so keeping them alive only buys floaters. */
+const SPRAY_CULL = 150;
 const SPRAY_CULL_SQ = SPRAY_CULL * SPRAY_CULL;
-/** Exaggerated gravity — arcade spray wants to arc, not hang. */
-const SPRAY_G = -17.5;
-/** Air drag, 1/s. Fine droplets shed horizontal speed fast. */
-const SPRAY_DRAG = 1.6;
-/** Depth-sort buckets. 96 over 230 m = 2.4 m granularity, finer than a sprite. */
-const SORT_BUCKETS = 96;
+/**
+ * Exaggerated gravity. Together with the drag below this is what glues the
+ * spray to the water: a droplet launched at 5 m/s reaches apex in ~0.19 s at
+ * ~0.5 m and is back on the surface by ~0.45 s, comfortably inside its life, so
+ * particles die by LANDING and essentially never by ageing out in mid-air.
+ */
+const SPRAY_G = -26.0;
+/** Air drag, 1/s. Fine droplets shed horizontal speed fast; 2.4 caps the
+ *  horizontal throw at v/2.4 metres, which keeps a burst around its own boat. */
+const SPRAY_DRAG = 2.4;
+/** Depth-sort buckets. 128 over 150 m = 1.2 m granularity, finer than a sprite. */
+const SORT_BUCKETS = 128;
 
 // ---------------------------------------------------------------------------
 //  Module-scope scratch. Nothing in this file allocates inside a frame.
@@ -330,34 +363,80 @@ void main() {
 
 const SPRAY_VERT = /* glsl */ `
 attribute vec3 iPos;
-attribute vec4 iData;   // x age01, y size (metres), z seed, w spin (radians)
+attribute vec4 iData;   // x age01, y size (metres), z seed, w aspect bias
+attribute vec3 iVel;    // world velocity — this is what points the flick
 
-varying vec2  vUv;
+varying vec2  vP;       // local sprite space, -1..1, +y = direction of travel
+varying vec2  vDown;    // screen-down resolved into vP space, unit length
 varying float vAge;
 varying float vSeed;
 varying float vDepth;
+varying float vInk;
+
+float h11v(float x) { return fract(sin(x * 127.13) * 43758.5453); }
 
 void main() {
-  vUv = uv;
   vAge = iData.x;
   vSeed = iData.z;
-
   float s = iData.y;
-  float c = cos(iData.w);
-  float sn = sin(iData.w);
-  vec2 q = vec2(position.x * c - position.y * sn,
-                position.x * sn + position.y * c) * s;
 
   // Screen-aligned billboard taken from the view matrix rows. Screen-aligned
-  // rather than view-plane-aligned on purpose: the ink rim below has to sit on
-  // the screen-down side of the shape for it to read as a drawn line, and that
+  // rather than view-plane-aligned on purpose: the ink line below has to sit on
+  // the screen-down side of the shape for it to read as a drawn edge, and that
   // only holds if the sprite inherits camera roll.
   vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
   vec3 up    = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
 
-  vec3 wp = iPos + right * q.x + up * q.y;
+  // Project world velocity onto the screen basis and orient the sprite along
+  // it. Orientation is the entire difference between "torn sheet of water" and
+  // "cotton ball": a radially symmetric sprite has no direction to read, so a
+  // hundred of them read as a hundred separate objects rather than as motion.
+  vec2 sv = vec2(dot(iVel, right), dot(iVel, up));
+  float svl = length(sv);
+  vec2 dir = svl > 1e-3 ? sv / svl : vec2(0.0, 1.0);
+
+  // Scatter the heading by up to +/-0.6 rad. Every particle in a burst carries
+  // very nearly the same velocity, so orienting strictly along it combs the
+  // whole mass one way and it stops reading as water: over a white foam ribbon
+  // a hundred identically-angled flicks tile into feathers or fish scales. The
+  // jitter is seeded, so a given particle keeps its angle for its whole life.
+  float jit = (h11v(vSeed * 5.17 + 1.3) - 0.5) * 1.2;
+  float cj = cos(jit);
+  float sj = sin(jit);
+  dir = vec2(dir.x * cj - dir.y * sj, dir.x * sj + dir.y * cj);
+
+  // Stretch along travel. 0.035/(m/s) puts a 20 m/s droplet at 1.7x and the cap
+  // at 2.3 stops a boosted one turning into a laser. The 1/sqrt on the cross
+  // axis holds the painted area roughly constant so fast spray thins rather
+  // than growing, and iData.w scatters the aspect so the flicks are not clones.
+  float stretch = clamp((1.0 + length(iVel) * 0.035) * iData.w, 0.85, 2.3);
+  float xs = 0.86 / sqrt(stretch);
+
+  vec2 lp = position.xy * 2.0;   // quad is +/-0.5 -> local -1..1
+  vP = lp;
+
+  vec2 q = vec2(lp.x * xs, lp.y * stretch) * (s * 0.5);
+  vec2 ex = vec2(dir.y, -dir.x);          // screen perpendicular of dir
+  vec2 scr = ex * q.x + dir * q.y;
+
+  // Screen-down (0,-1) resolved into the (ex, dir) frame, then divided back
+  // through the anisotropic scale so it is correct in the UNSCALED vP space the
+  // fragment shader works in. dot((0,-1), ex) = dir.x, dot((0,-1), dir) = -dir.y.
+  vec2 dl = vec2(dir.x / xs, -dir.y / stretch);
+  vDown = normalize(dl + vec2(1e-6, 0.0));
+
+  vec3 wp = iPos + right * scr.x + up * scr.y;
   vec4 mv = viewMatrix * vec4(wp, 1.0);
   vDepth = -mv.z;
+
+  // Ink gate. A 15 px flick with a drawn line all round it is a bubble; ink is
+  // only affordable on the sprites big and near enough to read as a brush
+  // stroke, which is deliberately a small minority of any burst — that handful
+  // of accented shapes is what gives the mass a hierarchy instead of a texture.
+  // The size range tops out around 0.75 m, so 0.34..0.62 lets roughly the
+  // largest sixth of a burst carry a line and leaves the rest bare.
+  vInk = smoothstep(0.34, 0.62, s) * (1.0 - smoothstep(26.0, 65.0, vDepth));
+
   gl_Position = projectionMatrix * mv;
 }
 `;
@@ -373,65 +452,122 @@ uniform vec3  uFogColor;
 uniform float uFogNear;
 uniform float uFogFar;
 
-varying vec2  vUv;
+varying vec2  vP;
+varying vec2  vDown;
 varying float vAge;
 varying float vSeed;
 varying float vDepth;
+varying float vInk;
 
-float h11(float x) { return fract(sin(x * 127.13) * 43758.5453); }
+/**
+ * Trig-free hash (Hoskins' hash11). It only has to decorrelate a handful of
+ * per-particle constants, and it runs per fragment on every spray pixel in the
+ * frame, so the fract(sin()) form's transcendental is not worth paying for.
+ */
+float hs(float x) {
+  x = fract(x * 0.1031);
+  x *= x + 33.33;
+  x *= x + x;
+  return fract(x);
+}
 
-// Three-lobe metaball. Thresholding a metaball field gives a silhouette with
-// concave joins between the lobes — the shape a brush makes when it splits —
-// which a sum of hard circles cannot produce.
-float blobField(vec2 p, float seed) {
-  float a = h11(seed * 7.13);
-  float b = h11(seed * 3.71 + 2.0);
-  float c = h11(seed * 11.9 + 5.0);
-  vec2 o1 = vec2(-0.30 + 0.18 * a,  0.12 - 0.24 * b);
-  vec2 o2 = vec2( 0.28 - 0.16 * b,  0.24 - 0.32 * c);
-  vec2 o3 = vec2( 0.02 + 0.22 * (c - 0.5), -0.30 + 0.16 * a);
-  float r1 = 0.34 + 0.10 * a;
-  float r2 = 0.26 + 0.12 * b;
-  float r3 = 0.19 + 0.10 * c;
-  float f = 0.0;
-  f += (r1 * r1) / max(dot(p - o1, p - o1), 1e-4);
-  f += (r2 * r2) / max(dot(p - o2, p - o2), 1e-4);
-  f += (r3 * r3) / max(dot(p - o3, p - o3), 1e-4);
-  return f;
+/** cos/sin of 72°, the spacing of the five silhouette edges. */
+const float C72 = 0.309017;
+const float S72 = 0.951057;
+
+/**
+ * Torn-scrap silhouette, as a signed field: positive inside, and close enough
+ * to a distance function that fwidth() gives a clean one-pixel edge everywhere.
+ *
+ * Built as the INTERSECTION OF FIVE HALF-PLANES, then bitten by two circles.
+ *
+ * The half-planes are the point. Round 2 used a sum of metaballs and the round
+ * 3 first attempt used an irregular polygon expressed in polar form — both look
+ * angular written down and both rasterise to a lumpy ball, because any field
+ * defined as radius-versus-angle curves between its corners. Intersecting half-
+ * planes is the only cheap construction that yields genuinely STRAIGHT edges
+ * meeting at hard corners, which is what a sheet of water torn off a hull looks
+ * like when it is drawn flat. The two circular bites then take the shape
+ * concave, so the outline reads torn rather than cleanly cut.
+ *
+ * The sprite is oriented with +y along travel, so the -y half is additionally
+ * pinched into a tail and the whole thing reads as a flick, not a pebble.
+ */
+float sprayField(vec2 p, float seed) {
+  // Per-particle tail. At 0.25 it is a chunky scrap, at 1.2 a thin comma; a
+  // fixed value makes every sprite the same glyph and a field of identical
+  // glyphs tiles like fish scales instead of reading as spray.
+  float pinch = 0.25 + 0.95 * hs(seed + 4.0);
+  float k = clamp(-p.y, 0.0, 1.0);
+  vec2 q = vec2(p.x * (1.0 + pinch * k * k), p.y);
+
+  // Rotate the whole edge fan per particle. Drawn as a random unit VECTOR
+  // rather than an angle so no trig is needed here either.
+  vec2 n = normalize(vec2(hs(seed + 1.0) - 0.5 + 1e-4, hs(seed + 2.0) - 0.5));
+
+  float d = 1e9;
+  for (int i = 0; i < 5; i++) {
+    // Each edge is pushed out by its own offset in 0.38..0.94, which is what
+    // makes the pentagon irregular — long faces on one side, clipped corners on
+    // the other. Equal offsets would give a regular pentagon, i.e. a logo.
+    float c = 0.38 + 0.56 * hs(seed + 11.0 + float(i) * 7.3);
+    d = min(d, c - dot(n, q));
+    n = vec2(n.x * C72 - n.y * S72, n.x * S72 + n.y * C72);
+  }
+
+  // Two bites. Centres sit at 0.72 + 0.8r from the origin, i.e. always further
+  // out than their own radius, so the bite can never swallow the shape — the
+  // origin stays inside for every seed and no particle renders empty.
+  for (int j = 0; j < 2; j++) {
+    float fj = float(j);
+    vec2 bo = normalize(
+      vec2(hs(seed + 21.0 + fj * 3.0) - 0.5 + 1e-4, hs(seed + 27.0 + fj * 3.0) - 0.5)
+    );
+    float rb = 0.40 + 0.45 * hs(seed + 33.0 + fj * 3.0);
+    d = min(d, length(q - bo * (0.72 + rb * 0.8)) - rb);
+  }
+  return d;
 }
 
 void main() {
-  vec2 p = vUv * 2.0 - 1.0;
-  float f = blobField(p, vSeed);
+  vec2 p = vP;
+  float d = sprayField(p, vSeed);   // signed: > 0 inside
 
-  // Hard threshold at f = 1 with exactly one pixel of coverage either side.
-  // Deriving the width from fwidth instead of hard-coding it is what keeps the
-  // silhouette equally crisp on a 12 px distant droplet and a 300 px hero
-  // splash; a fixed band aliases on one and goes gummy on the other. The clamp
-  // stops the 1/d² field's exploding gradient near a lobe centre from turning
-  // the whole sprite into a soft blob.
-  float w = clamp(fwidth(f) * 0.7, 0.02, 0.5);
-  float a = smoothstep(1.0 - w, 1.0 + w, f);
+  // One pixel of coverage either side of the boundary. The field is distance-
+  // like so fwidth is bounded and the clamp almost never bites; the upper end
+  // only engages on a sprite a couple of pixels across, where a soft edge is
+  // far better than the per-pixel stipple the old metaball's exploding gradient
+  // produced along its whole rim.
+  float w = clamp(fwidth(d) * 0.8, 0.005, 0.35);
+  float a = smoothstep(-w, w, d);
   if (a <= 0.004) discard;
 
-  // Ink band on the underside: the shape MINUS the shape shifted up. 0.17 is in
-  // local quad units, so the line thickens with the sprite the way a brush
-  // stroke does, instead of pretending to be a constant-width technical pen.
-  float fUp = blobField(p - vec2(0.0, 0.17), vSeed);
-  float rim = a * (1.0 - smoothstep(1.0 - w, 1.0 + w, fUp));
+  // How far toward the screen-down side of the shape this pixel sits.
+  float low = dot(p, vDown);
 
-  // Two flat tones split on a hard threshold. f = 1 is the boundary and f = 1.7
-  // is roughly a third of the way to a lobe centre, so this puts the shade band
-  // as a rind around the shape and leaves a lit crown in the middle.
-  float belly = step(f, 1.70);
-  vec3 col = mix(uFoam, uFoamShade, belly * 0.82);
-  col *= mix(vec3(1.0), uSunColor, 0.30 * (1.0 - belly));
-  col = mix(col, uInk, rim * 0.92);
+  // Two flat tones, hard split. The shade tone is a wedge along the UNDERSIDE
+  // only — never a ring, because a ring is what turned every round-2 sprite
+  // into a soap bubble. (low - d*1.6) is positive only near the lower edge: at
+  // the bottom edge low is large and d ~ 0, at the centre low ~ 0 and d is
+  // large, at the top edge low is negative.
+  //
+  // The threshold is per-particle so the wedge is a sliver on some sprites and
+  // a third of the shape on others; holding it fixed stamps the same crescent
+  // on all of them and the mass turns back into a texture.
+  float shThr = 0.02 + 0.30 * hs(vSeed + 8.0);
+  float shade = step(shThr, low - d * 1.6);
+  vec3 col = mix(uFoam, uFoamShade, shade);
+  col *= mix(vec3(1.0), uSunColor, 0.22 * (1.0 - shade));
+
+  // Ink, lower edge only, gated on size and distance by vInk. Thickness is in
+  // local units so the line grows with the sprite the way a brush stroke does.
+  float ink = (1.0 - smoothstep(0.015, 0.05, d)) * smoothstep(0.10, 0.40, low);
+  col = mix(col, uInk, ink * vInk * 0.9);
 
   // Quantised opacity: pop in over two frames, then step down in four levels.
   // Quantising the FADE and not the edge keeps the silhouette antialiased while
   // the dissolve itself stays cel — spray blinks out, it does not dim away.
-  float fade = smoothstep(0.0, 0.05, vAge) * (1.0 - smoothstep(0.70, 1.0, vAge));
+  float fade = smoothstep(0.0, 0.06, vAge) * (1.0 - smoothstep(0.62, 1.0, vAge));
   fade = floor(fade * 4.0 + 0.5) / 4.0;
 
   // Same five-step aerial perspective the cel material uses, so distant spray
@@ -510,8 +646,8 @@ export class WakeSystem {
   private readonly pLife = new Float32Array(MAX_PARTICLES);
   private readonly pSize = new Float32Array(MAX_PARTICLES);
   private readonly pSeed = new Float32Array(MAX_PARTICLES);
-  private readonly pSpin = new Float32Array(MAX_PARTICLES);
-  private readonly pSpinV = new Float32Array(MAX_PARTICLES);
+  /** Per-particle multiplier on the velocity stretch, so flicks are not clones. */
+  private readonly pAspect = new Float32Array(MAX_PARTICLES);
   /** Cached water height under each particle; refreshed lazily, see update(). */
   private readonly pWater = new Float32Array(MAX_PARTICLES);
   private live = 0;
@@ -521,6 +657,7 @@ export class WakeSystem {
   private readonly sprayMesh: InstancedMesh;
   private readonly iPos: InstancedBufferAttribute;
   private readonly iData: InstancedBufferAttribute;
+  private readonly iVel: InstancedBufferAttribute;
 
   // depth-sort scratch
   private readonly sortKey = new Int32Array(MAX_PARTICLES);
@@ -683,13 +820,24 @@ export class WakeSystem {
     this.iData = new InstancedBufferAttribute(new Float32Array(MAX_PARTICLES * 4), 4).setUsage(
       DynamicDrawUsage
     ) as InstancedBufferAttribute;
+    this.iVel = new InstancedBufferAttribute(new Float32Array(MAX_PARTICLES * 3), 3).setUsage(
+      DynamicDrawUsage
+    ) as InstancedBufferAttribute;
     quadGeo.setAttribute('iPos', this.iPos);
     quadGeo.setAttribute('iData', this.iData);
+    quadGeo.setAttribute('iVel', this.iVel);
 
     const sprayMat = new ShaderMaterial({
       uniforms: {
-        uFoam: { value: PAL.foam.clone().multiplyScalar(1.18) },
-        uFoamShade: { value: PAL.foamShade.clone() },
+        // 1.06 rather than the old 1.18: hundreds of small sprites overlap far
+        // more than dozens of large ones did, and stacking premultiplied colour
+        // that far over 1.0 smears the bloom into a single white cloud.
+        uFoam: { value: PAL.foam.clone().multiplyScalar(1.06) },
+        // A touch deeper than the ribbon's own shade tone. Spray is drawn ON
+        // TOP of the foam ribbon as often as it is drawn on open water, and at
+        // parity the sprites vanish into the ribbon and only their shade band
+        // survives — which is what reduced the mass to a texture.
+        uFoamShade: { value: PAL.foamShade.clone().multiplyScalar(0.9) },
         uInk: { value: PAL.ink.clone() },
         uSunColor: CEL_GLOBALS.uSunColor,
         uFogColor: CEL_GLOBALS.uFogColor,
@@ -785,7 +933,9 @@ export class WakeSystem {
    */
   emitSpray(pos: Vector3, dir: Vector3, amount: number, t: number): void {
     const amt = amount < 0 ? 0 : amount > 2.5 ? 2.5 : amount;
-    const n = Math.min(30, Math.round(3 + amt * 20));
+    // 14..110 instead of 3..30. A burst has to be a MASS; at thirty sprites the
+    // eye counts them, at a hundred it reads the outline of the whole cloud.
+    const n = Math.min(110, Math.round(14 + amt * 40));
     // One height solve for the whole burst. sampleHeight costs five Gerstner
     // evaluations; doing it per particle would put a 30-wave-eval spike on every
     // splash event, and the particles all start within a couple of metres.
@@ -803,7 +953,7 @@ export class WakeSystem {
     az /= al;
 
     for (let k = 0; k < n; k++) {
-      const speed = dl * (0.5 + 0.75 * this.rnd());
+      const speed = dl * (0.32 + 0.62 * this.rnd());
       // sqrt keeps the cone uniform in solid angle instead of clumping on axis.
       const spread = Math.sqrt(this.rnd()) * (0.30 + 0.28 * amt);
       const ang = this.rnd() * Math.PI * 2;
@@ -819,15 +969,27 @@ export class WakeSystem {
       by /= bl;
       bz /= bl;
 
+      // Spawn radius biased to the centre (r² of a uniform draw). A flat draw
+      // scatters the burst evenly over the disc and it reads as unrelated
+      // particles; concentrating it makes a dense core that thins outward, and
+      // the core is what ties the burst to the hull that threw it.
+      const rr = this.rnd();
+      const rad = rr * rr * 1.5;
+      const rang = this.rnd() * Math.PI * 2;
+
       this.spawn(
-        pos.x + (this.rnd() - 0.5) * 2.4,
-        pos.y + this.rnd() * 0.9,
-        pos.z + (this.rnd() - 0.5) * 2.4,
+        pos.x + Math.cos(rang) * rad,
+        pos.y + this.rnd() * 0.45,
+        pos.z + Math.sin(rang) * rad,
         (ux + ax * sx + bx * sy) * speed,
         (uy + by * sy) * speed,
         (uz + az * sx + bz * sy) * speed,
-        0.5 + this.rnd() * 0.8 + amt * 0.28,
-        0.55 + this.rnd() * 1.5 + amt * 0.9,
+        0.34 + this.rnd() * 0.42 + amt * 0.14,
+        // 0.09..0.85 m, against round 2's 0.55..4.3 m — one sprite used to cover
+        // the hull that threw it. The square on the scatter term is deliberate:
+        // it makes most of the burst small and a handful noticeably large, so
+        // the mass has a hierarchy instead of being a field of equal grains.
+        (0.15 + this.rnd() * 0.24 + amt * 0.09) * (0.6 + 1.25 * sq(this.rnd())),
         wh
       );
     }
@@ -1054,26 +1216,59 @@ export class WakeSystem {
 
       // ---- continuous spray off the wake at speed --------------------------
       // Rate-based, not per-frame, so it does not thin out when the frame rate
-      // climbs. Ramps in from half throttle-speed and tops out around 30/s.
-      if (speed01 > 0.5) {
-        this.wSprayBudget[i] += dt * (speed01 - 0.5) * 2 * (14 + 16 * speed01);
-        let guard = 8;
+      // climbs. Tops out around 160/s — five times the round-2 rate, because
+      // each particle is now roughly a quarter of the old linear size and a
+      // rooster tail is a QUANTITY of water, not a handful of big shapes.
+      //
+      // The ramp starts at 26 % of top speed, not 50 %. Round 2 gated at half
+      // speed with a linear ramp, which meant a boat cruising at 82 km/h — most
+      // of the time the player spends racing — emitted under ten particles a
+      // second and threw no visible water at all. Everything visible in those
+      // frames was a landing splash.
+      const sprayRamp = smooth01(speed01, 0.26, 0.75);
+      if (sprayRamp > 0.01) {
+        this.wSprayBudget[i] += dt * sprayRamp * (150 + 300 * speed01);
+        // 40 rather than 8: at 310/s a 30 fps frame owes ten particles and a
+        // hitch-limited 0.05 s step owes sixteen, so 8 was clipping the rate at
+        // low frame rates and thinning the tail exactly when it is most
+        // visible. 40 leaves headroom without letting a stall dump the pool.
+        let guard = 40;
         while (this.wSprayBudget[i] >= 1 && guard-- > 0) {
           this.wSprayBudget[i] -= 1;
           const side = this.rnd() < 0.5 ? -1 : 1;
-          const lat = (1.1 + 1.6 * speed01) * side;
-          const bx = x - tx * 2.0 - tz * lat;
-          const bz = z - tz * 2.0 + tx * lat;
+          // Bias the lateral offset toward the hull so the sheet is dense at
+          // the rail and frays outward, instead of a uniform curtain.
+          const u = this.rnd();
+          const lat = (0.7 + (1.0 + 1.4 * speed01) * u * u) * side;
+          // Emit right against the hull, 0.6..2.0 m aft. Trailing the spawn
+          // point further back smears the sheet along the boat's path and it
+          // reads as debris left behind rather than as water the hull is
+          // throwing right now.
+          const along = 0.6 + this.rnd() * 1.4;
+          const bx = x - tx * along - tz * lat;
+          const bz = z - tz * along + tx * lat;
           const wh = sampleHeight(bx, bz, t);
           this.spawn(
             bx,
-            wh + 0.25,
+            wh + 0.1,
             bz,
-            -tx * (1.5 + 3 * speed01) - tz * lat * (0.9 + 0.6 * drift),
-            3.0 + 5.5 * speed01 + this.rnd() * 2.5,
-            -tz * (1.5 + 3 * speed01) + tx * lat * (0.9 + 0.6 * drift),
-            0.35 + this.rnd() * 0.45,
-            0.35 + this.rnd() * 0.7 + speed01 * 0.5,
+            -tx * (1.2 + 2.2 * speed01) - tz * lat * (0.7 + 0.5 * drift),
+            // 1.6..5.4 m/s up, against g = -26: apex ~0.2 s at ~0.5 m and back
+            // down by ~0.45 s. The round-2 launch was 3..11 m/s against -17.5,
+            // which threw droplets 2.5 m into the air where they aged out —
+            // that is exactly the "white shape floating detached" defect.
+            1.6 + 2.4 * speed01 + this.rnd() * 1.4,
+            -tz * (1.2 + 2.2 * speed01) + tx * lat * (0.7 + 0.5 * drift),
+            // 0.22..0.64 s. Short on purpose: at 23 m/s a particle that lives a
+            // second is fourteen metres astern by the time it dies, so the
+            // sheet spreads into a thin trail of separate chips. Halving the
+            // life and tripling the rate puts the same water in a third of the
+            // distance, which is the difference between a scatter and a mass.
+            0.22 + this.rnd() * 0.26 + speed01 * 0.16,
+            // Same heavy-tailed scatter as the burst: 0.08..0.95 m, most of it
+            // down at the bottom of that range. Even the top of it is a sixth
+            // of a hull length, against round 2's 1.55 m stern sprites.
+            (0.12 + this.rnd() * 0.18 + speed01 * 0.11) * (0.6 + 1.25 * sq(this.rnd())),
             wh
           );
         }
@@ -1323,8 +1518,7 @@ export class WakeSystem {
     this.pLife[i] = life;
     this.pSize[i] = size;
     this.pSeed[i] = this.rnd() * 64;
-    this.pSpin[i] = this.rnd() * Math.PI * 2;
-    this.pSpinV[i] = (this.rnd() - 0.5) * 3.2;
+    this.pAspect[i] = 0.8 + this.rnd() * 0.7;
     this.pWater[i] = water;
   }
 
@@ -1354,7 +1548,6 @@ export class WakeSystem {
       const x = (this.px[i] += this.vx[i] * dt);
       const y = (this.py[i] += this.vy[i] * dt);
       const z = (this.pz[i] += this.vz[i] * dt);
-      this.pSpin[i] += this.pSpinV[i] * dt;
 
       const dxf = x - fx;
       const dzf = z - fz;
@@ -1367,13 +1560,22 @@ export class WakeSystem {
         // Refresh the cached water height when the particle is closing on the
         // surface, and only every third frame otherwise. The exact solve is
         // five Gerstner evaluations; running it for every airborne droplet
-        // every frame is the single most expensive thing this file could do.
-        const near = y - this.pWater[i] < 1.2;
+        // every frame is the single most expensive thing this file could do —
+        // and the pool is now nearly four times as big, so the gate matters
+        // more than it did. A rising particle cannot be about to land, which
+        // takes the per-frame solve off roughly half the population for free.
+        // 0.5 m of margin: the stride-3 path refreshes at worst every 3 frames,
+        // and the fastest a descending droplet falls is ~6 m/s = 0.3 m in that
+        // window, so the exact solve always switches on before the crossing.
+        const near = this.vy[i] <= 0 && y - this.pWater[i] < 0.5;
         if (near || (i + parity) % 3 === 0) this.pWater[i] = sampleHeight(x, z, t);
 
         if (y <= this.pWater[i]) {
-          // Landed: leave a small foam mark and retire.
-          if (this.deathStamps < MAX_DEATH_STAMPS) {
+          // Landed: leave a small foam mark and retire. The mark is smaller and
+          // weaker than round 2 because far more particles now reach the water
+          // (which is the point) and the stamp budget would otherwise be spent
+          // burning a solid white patch under every boat.
+          if (this.deathStamps < MAX_DEATH_STAMPS && this.pSize[i] > 0.25) {
             const lx = x - this.centre.x;
             const lz = z - this.centre.y;
             if (Math.abs(lx) < half && Math.abs(lz) < half) {
@@ -1381,8 +1583,8 @@ export class WakeSystem {
               this.pushBlob(
                 lx,
                 lz,
-                0.5 + this.pSize[i] * 0.55,
-                0.2,
+                0.34 + this.pSize[i] * 0.7,
+                0.13,
                 0.8,
                 1.0,
                 this.pSeed[i] * 3.1
@@ -1412,8 +1614,7 @@ export class WakeSystem {
       this.pLife[i] = this.pLife[last];
       this.pSize[i] = this.pSize[last];
       this.pSeed[i] = this.pSeed[last];
-      this.pSpin[i] = this.pSpin[last];
-      this.pSpinV[i] = this.pSpinV[last];
+      this.pAspect[i] = this.pAspect[last];
       this.pWater[i] = this.pWater[last];
     }
   }
@@ -1463,6 +1664,7 @@ export class WakeSystem {
 
     const P = this.iPos.array as Float32Array;
     const D = this.iData.array as Float32Array;
+    const V = this.iVel.array as Float32Array;
 
     // order[] is ascending in depth; walk it backwards to draw far first.
     for (let s = 0; s < n; s++) {
@@ -1472,12 +1674,17 @@ export class WakeSystem {
       P[s * 3 + 1] = this.py[i];
       P[s * 3 + 2] = this.pz[i];
       D[s * 4] = a01;
-      // Pop to full size over the first fifth of life, then shrink to 55 %.
-      // The pop is what sells the droplet as *thrown* rather than faded in.
+      // Pop to full size over the first eighth of life, then shrink hard — to
+      // 22 % by the end rather than round 2's 55 %. The few particles that do
+      // age out in mid-air instead of landing have to be nearly gone by then,
+      // or each one is a white shape hanging over the water with no cause.
       D[s * 4 + 1] =
-        this.pSize[i] * (0.35 + 0.65 * smooth01(a01, 0.0, 0.2)) * (1 - 0.45 * a01 * a01);
+        this.pSize[i] * (0.45 + 0.55 * smooth01(a01, 0.0, 0.12)) * (1 - 0.78 * a01 * a01);
       D[s * 4 + 2] = this.pSeed[i];
-      D[s * 4 + 3] = this.pSpin[i];
+      D[s * 4 + 3] = this.pAspect[i];
+      V[s * 3] = this.vx[i];
+      V[s * 3 + 1] = this.vy[i];
+      V[s * 3 + 2] = this.vz[i];
     }
 
     this.iPos.clearUpdateRanges();
@@ -1486,6 +1693,9 @@ export class WakeSystem {
     this.iData.clearUpdateRanges();
     this.iData.addUpdateRange(0, n * 4);
     this.iData.needsUpdate = true;
+    this.iVel.clearUpdateRanges();
+    this.iVel.addUpdateRange(0, n * 3);
+    this.iVel.needsUpdate = true;
   }
 
   // -------------------------------------------------------------------------
@@ -1514,6 +1724,11 @@ export class WakeSystem {
     (this.sprayMesh.material as ShaderMaterial).dispose();
     this.sprayMesh.dispose();
   }
+}
+
+/** x², used to skew a uniform draw toward zero. */
+function sq(x: number): number {
+  return x * x;
 }
 
 /** Scalar smoothstep with GLSL semantics. */
