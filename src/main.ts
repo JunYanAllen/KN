@@ -35,6 +35,8 @@ class Game {
   riders: Rider[] = [];
   ai: AIRacer[] = [];
   race: RaceManager;
+  /** Optional AI driving the player boat — the screenshot harness uses it. */
+  playerBot: AIRacer | null = null;
   rig: CameraRig;
   input: Input;
   hud: Hud;
@@ -42,9 +44,17 @@ class Game {
 
   t = 0;
   running = true;
+  /**
+   * Skips the wake render-target passes and spray integration for this step.
+   * Only the screenshot harness sets it, while fast-forwarding through race
+   * time it does not need to see: those passes are three 1024² fullscreen
+   * draws, trivial on a GPU and ruinous under a software rasteriser.
+   */
+  skipHeavyFx = false;
   /** When true the loop only advances via `step()` — used by the shot harness. */
   manualStep = false;
-  private _last = performance.now();
+  /** Wall-clock stamp of the previous frame; the shot harness resets it. */
+  _last = performance.now();
   private _tmp = new Vector3();
   private _tmp2 = new Vector3();
 
@@ -107,8 +117,15 @@ class Game {
     this.hud.resize(w, h, dpr);
   }
 
-  /** One simulation + render step. `dt` is already clamped by the caller. */
-  step(dt: number) {
+  /**
+   * One simulation + render step. `dt` is already clamped by the caller.
+   *
+   * `render` exists for the screenshot harness: fast-forwarding 40 seconds of
+   * race means ~2400 simulation steps, and drawing every one of them under a
+   * software rasteriser would take an hour. The simulation is deterministic
+   * either way — only the last step needs to reach the framebuffer.
+   */
+  step(dt: number, render = true) {
     const t = (this.t += dt);
     CEL_GLOBALS.uTime.value = t;
 
@@ -116,9 +133,18 @@ class Game {
     this.input.update(dt);
     const racing = this.race.state === 'racing';
     const p = this.player.input;
-    p.throttle = racing ? this.input.throttle : 0;
-    p.steer = racing ? this.input.steer : 0;
-    p.drift = racing && this.input.drift;
+    if (this.playerBot) {
+      this.playerBot.update(dt, t, this.boats);
+      if (!racing) {
+        p.throttle = 0;
+        p.steer = 0;
+        p.drift = false;
+      }
+    } else {
+      p.throttle = racing ? this.input.throttle : 0;
+      p.steer = racing ? this.input.steer : 0;
+      p.drift = racing && this.input.drift;
+    }
 
     // ---- AI --------------------------------------------------------------
     for (const a of this.ai) a.update(dt, t, this.boats);
@@ -144,8 +170,8 @@ class Game {
       });
 
       const speed01 = Math.min(1, b.speed / 42);
-      this.wake.emitWake(i, b.position, b.forward, speed01, b.driftCharge);
-      if (b.events.splash > 0.01) {
+      if (!this.skipHeavyFx) this.wake.emitWake(i, b.position, b.forward, speed01, b.driftCharge);
+      if (b.events.splash > 0.01 && !this.skipHeavyFx) {
         this.wake.emitSpray(
           b.position,
           this._tmp.copy(b.velocity).multiplyScalar(-0.35).setY(6),
@@ -162,7 +188,7 @@ class Game {
       );
     }
 
-    this.wake.update(dt, t, this.player.position);
+    if (!this.skipHeavyFx) this.wake.update(dt, t, this.player.position);
     this.ocean.update(dt, t, this.engine.camera);
     this.course.update(dt, t, this.engine.camera);
     this.sky.update(dt, t, this.engine.camera);
@@ -218,8 +244,12 @@ class Game {
       b.events.landed = 0;
     }
 
-    this.post.render(dt);
-    this.engine.renderer.info.reset();
+    if (render) {
+      // Reset before drawing, not after, so `info` still describes the frame
+      // that was just produced when a tool reads it.
+      this.engine.renderer.info.reset();
+      this.post.render(dt);
+    }
   }
 
   loop = () => {
@@ -280,16 +310,85 @@ window.addEventListener('keydown', (e) => {
     game.manualStep = false;
     game._last = performance.now();
   },
-  /** Advance `seconds` of simulation in fixed 1/60 slices. */
+  /**
+   * Advance `seconds` of simulation in fixed 1/60 slices. Only the final slice
+   * is drawn — the simulation does not read back from the framebuffer, so the
+   * resulting frame is identical to having drawn every step, just far faster.
+   */
   advance(seconds: number) {
     const h = 1 / 60;
-    for (let s = 0; s < seconds; s += h) game.step(h);
+    const n = Math.max(1, Math.round(seconds / h));
+    // The wake ribbon fully dissipates in ~6 s, so simulating its last 4 s is
+    // indistinguishable from having simulated all of it — and vastly cheaper.
+    const tail = Math.max(0, n - 240);
+    for (let i = 0; i < n; i++) {
+      game.skipHeavyFx = i < tail;
+      game.step(h, i === n - 1);
+    }
+    game.skipHeavyFx = false;
+  },
+  /** Draw the current state without advancing time. */
+  draw() {
+    game.step(0, true);
   },
   setCam(mode: string) {
+    game.rig.frozen = false;
     game.rig.mode = mode as never;
+  },
+  /**
+   * Park the camera at a fixed inspection angle relative to the player boat.
+   * These are the angles the visual critic reviews: a low water-level shot for
+   * the swell, a close shot for the rider, and a horizon shot for tiling.
+   */
+  debugCam(name: string) {
+    const b = game.player;
+    const c = game.engine.camera;
+    const f = b.forward;
+    const r = b.right;
+    game.rig.frozen = true;
+    const at = new Vector3().copy(b.position);
+    switch (name) {
+      case 'water': // just above the surface, looking along the swell
+        c.position.set(
+          b.position.x - f.x * 16 + r.x * 3,
+          b.position.y + 1.15,
+          b.position.z - f.z * 16 + r.z * 3
+        );
+        at.y += 0.9;
+        break;
+      case 'rider': // close three-quarter on the rider
+        c.position.set(
+          b.position.x + f.x * 3.4 + r.x * 3.6,
+          b.position.y + 1.9,
+          b.position.z + f.z * 3.4 + r.z * 3.6
+        );
+        at.y += 1.2;
+        break;
+      case 'horizon': // eye level, looking away from the boat at open water
+        c.position.set(b.position.x, b.position.y + 4.5, b.position.z);
+        at.set(b.position.x + f.x * 300, b.position.y + 6, b.position.z + f.z * 300);
+        break;
+      case 'top': // high plan view — exposes clipmap rings and wave lattice
+        c.position.set(b.position.x, b.position.y + 210, b.position.z - 60);
+        break;
+      default:
+        game.rig.frozen = false;
+        return;
+    }
+    c.lookAt(at);
+    c.updateProjectionMatrix();
   },
   skipCountdown() {
     game.race.forceStart();
+  },
+  /**
+   * Hand the player boat to an AI. Without this every captured frame shows a
+   * stationary player, because headless has nobody holding the throttle.
+   */
+  autopilot(on = true) {
+    game.playerBot = on
+      ? new AIRacer(game.boats[0], game.course, game.race, 'clean', 4242)
+      : null;
   },
   state() {
     return {

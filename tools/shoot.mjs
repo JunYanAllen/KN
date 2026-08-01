@@ -42,7 +42,10 @@ const SHOTS = [
     name: 'countdown',
     t: 1.5,
     note: 'cinematic orbit during the countdown — silhouettes, grid, sky',
-    setup: (g) => g.setCam('orbit'),
+    setup: (g) => {
+      g.autopilot(true);
+      g.setCam('orbit');
+    },
   },
   {
     name: 'chase',
@@ -50,6 +53,7 @@ const SHOTS = [
     note: 'the shot the player looks at for three laps',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
   },
@@ -59,6 +63,7 @@ const SHOTS = [
     note: 'low camera on the swell — Gerstner shape, bands, crest foam',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
     after: (g) => g.debugCam?.('water'),
@@ -69,6 +74,7 @@ const SHOTS = [
     note: 'four boats close together — outlines against each other',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
   },
@@ -78,6 +84,7 @@ const SHOTS = [
     note: 'close on the rider — is it animated or is it a prop',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
     after: (g) => g.debugCam?.('rider'),
@@ -88,6 +95,7 @@ const SHOTS = [
     note: 'airtime off the cross-swell section',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
   },
@@ -97,6 +105,7 @@ const SHOTS = [
     note: 'looking at the horizon — tiling, fade, sky banding',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
     after: (g) => g.debugCam?.('horizon'),
@@ -107,8 +116,20 @@ const SHOTS = [
     note: 'HUD legibility mid-race',
     setup: (g) => {
       g.skipCountdown();
+      g.autopilot(true);
       g.setCam('chase');
     },
+  },
+  {
+    name: 'top',
+    t: 30,
+    note: 'plan view — clipmap rings, wave lattice, course layout',
+    setup: (g) => {
+      g.skipCountdown();
+      g.autopilot(true);
+      g.setCam('chase');
+    },
+    after: (g) => g.debugCam('top'),
   },
 ];
 
@@ -182,7 +203,7 @@ const main = async () => {
   const results = [];
   for (const shot of SHOTS) {
     if (ONLY.length && !ONLY.includes(shot.name)) continue;
-    process.stdout.write(`  → ${shot.name} (t=${shot.t}s) ... `);
+    const t0 = Date.now();
 
     // Fresh deterministic run per shot so shots never contaminate each other.
     await page.evaluate(() => {
@@ -206,16 +227,23 @@ const main = async () => {
         },
         { src: shot.after.toString() }
       );
-      await page.evaluate(() => window.__GAME.advance(0.05));
+      // Draw without advancing: the parked camera was positioned against the
+      // boat's pose at exactly `shot.t`, so moving time would slide it.
+      await page.evaluate(() => window.__GAME.draw());
     }
     await sleep(120);
 
     const state = await page.evaluate(() => window.__GAME.state());
     const file = path.join(OUT, `${shot.name}.png`);
-    await page.screenshot({ path: file });
+    // SwiftShader is a software rasteriser — a retina frame of this scene takes
+    // seconds, not milliseconds. Be patient rather than pretending it hung.
+    await page.screenshot({ path: file, timeout: 180000, animations: 'disabled' });
     results.push({ ...shot, file, state });
     console.log(
-      `ok  [${state.calls} draw calls, ${(state.tris / 1000).toFixed(0)}k tris, place ${state.place}]`
+      `  ✓ ${shot.name.padEnd(10)} t=${String(shot.t).padStart(4)}s  ` +
+        `${String(state.calls).padStart(4)} calls  ` +
+        `${(state.tris / 1000).toFixed(0).padStart(4)}k tris  ` +
+        `${(Date.now() - t0) / 1000}s`
     );
   }
 
@@ -225,9 +253,11 @@ const main = async () => {
     for (const e of [...new Set(errors)].slice(0, 12)) console.log('   ' + e);
   }
 
-  await browser.close();
-  if (server) server.kill();
-  if (flag('strict') && errors.length) process.exit(2);
+  // SwiftShader occasionally refuses to tear its context down. Do not let that
+  // hold the whole capture hostage — the frames are already on disk.
+  await Promise.race([browser.close(), sleep(8000)]);
+  if (server) server.kill('SIGKILL');
+  process.exit(flag('strict') && errors.length ? 2 : 0);
 };
 
 main().catch((e) => {
