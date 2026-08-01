@@ -1,6 +1,8 @@
 import {
   BufferAttribute,
   BufferGeometry,
+  Color,
+  DataTexture,
   DoubleSide,
   DynamicDrawUsage,
   Matrix4,
@@ -8,11 +10,19 @@ import {
   Object3D,
   Quaternion,
   ShaderMaterial,
+  SRGBColorSpace,
   Vector3,
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { PAL } from '../core/Palette';
-import { addOutline, celMaterial, ensureCelAttributes, paintAO } from '../render/CelMaterial';
+import {
+  addOutline,
+  celMaterial,
+  ensureCelAttributes,
+  makeRampTexture,
+  paintAO,
+  type RampStop,
+} from '../render/CelMaterial';
 
 /**
  * ============================================================================
@@ -90,6 +100,67 @@ const sstep = (e0: number, e1: number, v: number) => {
   const t = clamp((v - e0) / (e1 - e0 || 1e-6), 0, 1);
   return t * t * (3 - 2 * t);
 };
+
+// ---------------------------------------------------------------------------
+//  Suit values. NOT new hues — new VALUES of hues already in the palette.
+// ---------------------------------------------------------------------------
+
+const _hsl = { h: 0, s: 0, l: 0 };
+
+/**
+ * Restate a committed palette colour at a different lightness / chroma. The hue
+ * is read straight off the source (PAL.suit is 222°, PAL.racer[i] whatever it
+ * is) and only L and S move — and they move in **sRGB**, because that is the
+ * space every number in Palette.ts was eyeballed in. Doing it in the renderer's
+ * linear working space instead is how "half as light" turns into "black".
+ */
+function tone(src: Color, l: number, satScale = 1): Color {
+  src.getHSL(_hsl, SRGBColorSpace);
+  return new Color().setHSL(_hsl.h, clamp(_hsl.s * satScale, 0, 1), l, SRGBColorSpace);
+}
+
+/**
+ * The garment, as five separated values. A rider read at 150 px tall is a
+ * VALUE composition before it is anything else: the previous suit was one flat
+ * 19%-lightness navy for torso, arms and legs, so the ramp's shadow band, the
+ * ink shell and the body all collapsed into a single black mass.
+ *
+ *   racer colour  ~62% L, full chroma  — helmet, chest yoke, belt, shoulder cap
+ *   SUIT_MID      52% L                — torso, hips, thighs
+ *   SUIT_DARK     32% L                — sleeves, forearms, shins  (the contrast
+ *                                        that makes a limb read off the torso)
+ *   SUIT_PALE     85% L                — gloves, knee plates, boot toes
+ *   PAL.skin      ~84% L               — face, neck
+ */
+const SUIT_MID = tone(PAL.suit, 0.52, 0.8);
+const SUIT_DARK = tone(PAL.suit, 0.38, 1.0);
+const SUIT_PALE = tone(PAL.suit, 0.85, 0.7);
+
+/**
+ * The rider gets its OWN four-band ramp, lifted off the world's.
+ *
+ * DEFAULT_RAMP's core shadow is 0.36 — correct for a hull the size of a car,
+ * catastrophic on a character, because a character is small, is the thing the
+ * eye goes to, and is made of parts whose separation has to survive the shadow
+ * side. Cel animation has always cheated this: characters are keyed higher and
+ * flatter than their backgrounds so the line work stays legible in shade.
+ *
+ * 0.50 / 0.68 / 0.95 / 1.08 keeps four unmistakable steps (the terminator is
+ * still a hard edge, still hue-shifted cool) while putting the shadow band a
+ * full stop and a half above where it was.
+ */
+const RIDER_RAMP: RampStop[] = [
+  { at: 0.0, tint: [0.5, 0.56, 0.74] }, // core shadow, cooled but not extinguished
+  { at: 0.44, tint: [0.68, 0.74, 0.88] }, // half tone
+  { at: 0.545, tint: [0.95, 0.96, 0.985] }, // light
+  { at: 0.76, tint: [1.08, 1.06, 0.98] }, // hot light, matches the world's
+];
+
+let _riderRamp: DataTexture | null = null;
+function riderRamp(): DataTexture {
+  if (!_riderRamp) _riderRamp = makeRampTexture(RIDER_RAMP);
+  return _riderRamp;
+}
 
 // ---------------------------------------------------------------------------
 //  Geometry construction
@@ -313,6 +384,13 @@ const L_FORE = 0.27; // elbow → wrist (the glove hangs off the far end)
 const L_THIGH = 0.42;
 const L_SHIN = 0.4;
 
+/**
+ * Fraction of full arm length the rider is driven to hold at the grips. See the
+ * `comfort` note on solveIK: this is the difference between a rider leaning on
+ * locked elbows and a rider crouched over the bars.
+ */
+const ARM_COMFORT = 0.88;
+
 const SHOULDER_X = 0.155;
 const SHOULDER_Y = 0.212;
 const SHOULDER_Z = 0.008;
@@ -389,12 +467,13 @@ let _matVisor: ShaderMaterial | null = null;
 function skinMaterial() {
   if (!_matSkin) {
     _matSkin = celMaterial({
+      ramp: riderRamp(),
       color: PAL.skin,
       color2: PAL.skinShade,
-      rim: 0.35,
+      rim: 0.2, // was 0.35 — a face-sized rim at 1/3 strength is a highlight, not a halo
       rimColor: PAL.skyHorizon,
       specSize: 0.42,
-      specStrength: 0.16, // skin gets a soft-shaped, weak highlight; it is not wet
+      specStrength: 0.12, // skin gets a soft-shaped, weak highlight; it is not wet
       matcapStrength: 0.0,
     });
     _matSkin.userData.shared = true;
@@ -402,18 +481,27 @@ function skinMaterial() {
   return _matSkin;
 }
 
+/**
+ * Sleeves, forearms, shins and boots — and, on `aTint = 1`, the hard PALE
+ * panels: the gloves, the knee plates and the boot toe caps.
+ *
+ * This material used to be `PAL.suit * 0.62` fading to `PAL.suitLight`, i.e.
+ * 12%-lightness navy fading to 34%-lightness navy. Both ends of that range sit
+ * below the torso, so every limb was a black tube with a black tube's worth of
+ * ink around it. Now it runs 32% → 85%: the sleeve is a deliberate dark against
+ * the 52% torso (that contrast is what separates the volumes) and the extremity
+ * is nearly white, which is how a racing glove is actually drawn.
+ */
 function gearMaterial() {
   if (!_matGear) {
-    // Gloves, sleeves, shin guards and boots. `suitDark` is PAL.suit at 62%
-    // value — a shade of the committed hue, not a new one.
-    const suitDark = PAL.suit.clone().multiplyScalar(0.62);
     _matGear = celMaterial({
-      color: suitDark,
-      color2: PAL.suitLight,
-      rim: 0.55,
+      ramp: riderRamp(),
+      color: SUIT_DARK,
+      color2: SUIT_PALE,
+      rim: 0.26, // was 0.55
       specSize: 0.2,
-      specStrength: 0.45,
-      matcapStrength: 0.14, // a hint of sky in the rubber, quantised to 4 steps
+      specStrength: 0.3, // was 0.45
+      matcapStrength: 0.12, // a hint of sky in the rubber, quantised to 4 steps
     });
     _matGear.userData.shared = true;
   }
@@ -421,30 +509,40 @@ function gearMaterial() {
 }
 
 /**
- * The visor. matcapStrength is deliberately near the top of its range so the
- * shield picks up the painted glint from the shared matcap, and the fragExtra
+ * The visor. The matcap gives the shield its painted glint and the fragExtra
  * lays two hard diagonal streaks over it — the hand-drawn "reflection" pair you
  * see on every anime helmet. They ride vNormalV, so they slide across the
  * shield as the head turns instead of being stuck to the mesh.
+ *
+ * BLOOM BUDGET. This material used to sum rim 0.9 (against near-white
+ * `PAL.foam`) + spec 1.3 + matcap 0.85 on top of an already bright base, which
+ * put a fist-sized patch of >2.0 linear luminance directly on the rider's head.
+ * BloomPass thresholds at 1.15, so the whole helmet got wrapped in a soft white
+ * disc. Everything here is now budgeted to stay under that except the tight
+ * specular chip, which is meant to be a glint. The streaks mix toward white
+ * rather than adding to it, so they are free.
  */
 function visorMaterial() {
   if (!_matVisor) {
     _matVisor = celMaterial({
+      ramp: riderRamp(),
       color: PAL.helmetVisor,
       color2: PAL.helmetVisor,
-      rim: 0.9,
-      rimColor: PAL.foam,
+      rim: 0.3, // was 0.9
+      rimColor: PAL.skyHorizon, // was PAL.foam (near paper white)
       rimPower: 2.0,
       specSize: 0.1, // tight, so the banded spec lands as a small hard chip
-      specStrength: 1.3,
-      matcapStrength: 0.85,
+      specStrength: 0.36, // was 1.3
+      matcapStrength: 0.5, // was 0.85
       fragExtra: /* glsl */ `
         // 44-degree diagonal measured in VIEW space -> the streak sweeps as the
         // head rotates. Two bands, hard-stepped: no gradient anywhere.
         float sx = vNormalV.x * 0.72 + vNormalV.y * 0.69;
         float streakA = step(0.14, sx) - step(0.29, sx);
         float streakB = step(-0.06, sx) - step(0.01, sx);
-        celColor = mix(celColor, vec3(1.0), streakA * 0.8 + streakB * 0.45);
+        // mix, never add: a streak can reach paper white but can never exceed it,
+        // so it draws a shape instead of feeding the bloom threshold.
+        celColor = mix(celColor, vec3(0.97, 0.99, 1.0), streakA * 0.82 + streakB * 0.46);
       `,
     });
     _matVisor.userData.shared = true;
@@ -459,7 +557,13 @@ function visorMaterial() {
 const SCARF_NODES = 5; // 4 simulated segments
 const SCARF_SEG = 0.105;
 const SCARF_W = [0.058, 0.052, 0.044, 0.033, 0.018];
-const SCARF_T = [0.013, 0.012, 0.01, 0.008, 0.005];
+/**
+ * Thickness. Bumped ~50%: the ink shell inflates by a world amount, and a
+ * ribbon 13 mm thick wrapped in a 12 mm shell is 65% ink when seen edge-on —
+ * which is exactly how a trailing scarf is usually seen, and exactly why it was
+ * rendering as a black rag off the shoulder instead of a racer-coloured one.
+ */
+const SCARF_T = [0.019, 0.017, 0.015, 0.012, 0.008];
 /** Fixed verlet substep. A ribbon this light goes unstable on a 60 Hz step. */
 const SCARF_H = 1 / 120;
 
@@ -529,32 +633,55 @@ export class Rider {
     const racer = PAL.racer[index % PAL.racer.length];
     const racerDark = PAL.racerDark[index % PAL.racerDark.length];
 
-    // Racing suit: dark navy body, the racer's colour as the hard block.
+    // Racing suit: a MID slate body so the racer block on top of it actually
+    // reads as a block. Torso, hips and thighs.
     const matSuit = celMaterial({
-      color: PAL.suit,
+      ramp: riderRamp(),
+      color: SUIT_MID,
       color2: racer,
-      rim: 0.6,
+      rim: 0.28, // was 0.6
       rimColor: PAL.skyHorizon,
       specSize: 0.3,
-      specStrength: 0.38,
-      matcapStrength: 0.1,
+      specStrength: 0.3,
+      matcapStrength: 0.08,
     });
-    // Helmet: racer colour shell, suit-dark vents and trim, hot graphic spec.
+    // Sleeves. Same hue, twenty points of lightness below the torso, with the
+    // deltoid cap still in the racer colour — an arm has to be a different
+    // value from the chest it crosses or the silhouette is one lump. This is
+    // what the interior Sobel and the ink shell need in order to be visible at
+    // all: a line only reads where the two sides of it differ.
+    const matSleeve = celMaterial({
+      ramp: riderRamp(),
+      color: SUIT_DARK,
+      color2: racer,
+      rim: 0.26,
+      rimColor: PAL.skyHorizon,
+      specSize: 0.28,
+      specStrength: 0.3,
+      matcapStrength: 0.08,
+    });
+    // Helmet: racer colour shell, darker vents and trim, one graphic spec chip.
+    // rim/spec are a third of what they were — see the note on visorMaterial.
     const matHelmet = celMaterial({
+      ramp: riderRamp(),
       color: racer,
       color2: racerDark,
-      rim: 0.75,
-      rimColor: PAL.foam,
+      rim: 0.3, // was 0.75
+      rimColor: PAL.skyHorizon, // was PAL.foam
       specSize: 0.18,
-      specStrength: 0.95,
-      matcapStrength: 0.34, // enough sky in the lacquer to read as a hard shell
+      specStrength: 0.38, // was 0.95
+      matcapStrength: 0.24, // enough sky in the lacquer to read as a hard shell
     });
+    // Scarf: racer colour at the collar running PALE at the tip. It used to run
+    // to `racerDark`, which against open water at speed was a black rag.
     const matScarf = celMaterial({
+      ramp: riderRamp(),
       color: racer,
-      color2: racerDark,
-      rim: 0.5,
+      color2: tone(racer, 0.8, 0.85),
+      rim: 0.28,
+      rimColor: PAL.skyHorizon,
       specSize: 0.4,
-      specStrength: 0.25,
+      specStrength: 0.22,
     });
     matScarf.side = DoubleSide; // CelOptions.side is typed FrontSide|BackSide
 
@@ -571,15 +698,18 @@ export class Rider {
     this.carrier.scale.setScalar(s);
 
     this.buildSkeleton();
-    this.buildBody(matSuit, matHelmet);
+    this.buildBody(matSuit, matSleeve, matHelmet);
     this.buildScarf(matScarf);
 
-    // Ink. 1.9 px against the boat's ~2.6 px: a character drawn with a lighter
-    // pen than its vehicle reads as *lighter*, which is what we want here.
+    // Ink. 1.6 px against the boat's ~2.6 px: a character drawn with a lighter
+    // pen than its vehicle reads as *lighter*, which is what we want here. The
+    // world cap comes down to 32 mm too — on a 42 mm-radius forearm the old
+    // 50 mm cap could inflate the shell wider than the limb it was outlining,
+    // which is the other half of why the arms looked like solid black tubes.
     this.object.traverse((o) => {
       const m = o as Mesh;
       if (m.isMesh && !m.userData.isOutline && !m.userData.noOutline) {
-        this.inkShells.push(addOutline(m, { widthPx: 1.9, color: PAL.ink, maxWorld: 0.05 }));
+        this.inkShells.push(addOutline(m, { widthPx: 1.6, color: PAL.ink, maxWorld: 0.032 }));
       }
     });
 
@@ -675,7 +805,7 @@ export class Rider {
     return m;
   }
 
-  private buildBody(matSuit: ShaderMaterial, matHelmet: ShaderMaterial) {
+  private buildBody(matSuit: ShaderMaterial, matSleeve: ShaderMaterial, matHelmet: ShaderMaterial) {
     const matSkin = skinMaterial();
     const matGear = gearMaterial();
     const matVisor = visorMaterial();
@@ -745,7 +875,20 @@ export class Rider {
       ],
       8
     );
-    this.attach(this.chest, join([chestBody, panel]), matSuit, 'chest');
+    // …and the same plate on the BACK, sitting on the mid-slate below the yoke.
+    // The chase camera looks at this rider's shoulder blades for three laps; a
+    // racer-coloured block back there is the only thing that identifies them
+    // from the angle the game is actually played at.
+    const backPanel = loft(
+      [
+        { y: 0.005, rx: 0.058, rz: 0.008, z: -0.098, square: 0.9, tint: 1 },
+        { y: 0.022, rx: 0.064, rz: 0.014, z: -0.104, square: 0.9, tint: 1 },
+        { y: 0.115, rx: 0.064, rz: 0.014, z: -0.108, square: 0.9, tint: 1 },
+        { y: 0.132, rx: 0.056, rz: 0.008, z: -0.1, square: 0.9, tint: 1 },
+      ],
+      8
+    );
+    this.attach(this.chest, join([chestBody, panel, backPanel]), matSuit, 'chest');
 
     // ---- neck: skin, and heavily occluded where the helmet sits on it ------
     const neckGeo = loft(
@@ -785,14 +928,20 @@ export class Rider {
     // flat (a real surface at y = 0.058) so we never see backfaces through the
     // aperture; the face egg above pokes through it, which is what reads as the
     // opening. No boolean, no hole, no z-fighting.
+    // The dark tint used to run from y = 0.088 all the way over the crown, so
+    // four fifths of the shell was `racerDark` and the helmet read as a brown
+    // lump instead of the racer's colour. It is now a single hard TRIM STRIPE
+    // between two bands of the racer colour — the crown is the brightest,
+    // highest-chroma thing on the character, which is where the eye should go.
     const dome = loft(
       [
         { y: 0.058, rx: 0.122, rz: 0.13, z: -0.006, square: 0.28 },
         { y: 0.085, rx: 0.128, rz: 0.134, z: -0.008, square: 0.25 },
         { y: 0.088, rx: 0.128, rz: 0.134, z: -0.008, square: 0.25, tint: 1 },
         { y: 0.108, rx: 0.122, rz: 0.126, z: -0.01, square: 0.2, tint: 1 },
-        { y: 0.138, rx: 0.098, rz: 0.1, z: -0.012, square: 0.15, tint: 1 },
-        { y: 0.162, rx: 0.05, rz: 0.052, z: -0.014, tint: 1 },
+        { y: 0.111, rx: 0.121, rz: 0.125, z: -0.0102, square: 0.2 },
+        { y: 0.138, rx: 0.098, rz: 0.1, z: -0.012, square: 0.15 },
+        { y: 0.162, rx: 0.05, rz: 0.052, z: -0.014 },
       ],
       12
     );
@@ -822,7 +971,26 @@ export class Rider {
         )
       );
     }
-    this.attach(this.head, join([dome, peak, fin, ...pods]), matHelmet, 'helmet');
+    // Occiput. The dome is capped flat at y = 0.058 and the face egg pokes up
+    // through it, which is what reads as the aperture — but the same egg is
+    // exposed at the BACK below that cap, so from the chase camera (i.e. the
+    // angle the game is played at) the rider had a strip of bare skin across
+    // the back of their skull. This wraps it, in the helmet's trim colour.
+    //
+    // It has to stay NARROWER on X than the face egg it hides behind (0.076 at
+    // the cheek) and shallower on Z than the ear pods, or a three-quarter view
+    // sees the nape's flank instead of the rider's face — which is what a first
+    // attempt at 0.108 half-width did. Bridging the gap between the two pods is
+    // the whole job; the pods already close the sides.
+    const nape = loft(
+      [
+        { y: -0.045, rx: 0.05, rz: 0.024, z: -0.056, square: 0.5, tint: 1, ao: 0.45 },
+        { y: 0.005, rx: 0.068, rz: 0.03, z: -0.058, square: 0.5, tint: 1, ao: 0.7 },
+        { y: 0.056, rx: 0.072, rz: 0.04, z: -0.054, square: 0.45, tint: 1, ao: 0.9 },
+      ],
+      8
+    );
+    this.attach(this.head, join([dome, peak, fin, nape, ...pods]), matHelmet, 'helmet');
     this.attach(this.head, face, matSkin, 'face');
 
     // Visor: a hard-cornered band across the eyes, proud of the face and just
@@ -860,7 +1028,7 @@ export class Rider {
         const elbow = 1 - 0.3 * sstep(-L_UPPER, -0.24, y) * sstep(0.0, 0.04, z);
         return clamp(armpit * elbow, 0.22, 1);
       });
-      this.attach(this.upperArm[i], ua, matSuit, `upperArm${i}`);
+      this.attach(this.upperArm[i], ua, matSleeve, `upperArm${i}`);
 
       // Forearm + glove. The glove is merged rather than given its own bone: on
       // a handlebar the wrist barely articulates, and it saves 2 draws a rider.
@@ -901,6 +1069,14 @@ export class Rider {
         [
           { y: -L_THIGH, rx: 0.058, rz: 0.062, square: 0.3 },
           { y: -0.33, rx: 0.064, rz: 0.07, square: 0.3 },
+          // Racer-coloured garter above the knee. Same 3 mm ring-pair trick as
+          // the belt: a colour boundary interpolated across 3 mm is a hard edge
+          // on screen. It breaks the thigh's 34 cm of unrelieved mid-slate and
+          // ties the leg back to the chest yoke and the helmet.
+          { y: -0.303, rx: 0.0672, rz: 0.0737, square: 0.29 },
+          { y: -0.3, rx: 0.0675, rz: 0.0741, square: 0.29, tint: 1 },
+          { y: -0.245, rx: 0.0732, rz: 0.0805, square: 0.27, tint: 1 },
+          { y: -0.242, rx: 0.0735, rz: 0.0809, square: 0.27 },
           { y: -0.2, rx: 0.078, rz: 0.086, square: 0.25 },
           { y: -0.08, rx: 0.09, rz: 0.096, square: 0.25 },
           { y: -0.02, rx: 0.094, rz: 0.098, square: 0.3, ao: 0.75 },
@@ -1016,7 +1192,15 @@ export class Rider {
     // Keeping it out of the prepass costs nothing: it carries its own ink shell.
     m.userData.noPrepass = true;
     this.object.add(m);
-    const shell = addOutline(m, { widthPx: 1.7, color: PAL.ink, maxWorld: 0.04 });
+    // Cap the scarf's ink at 7 mm of world push, roughly a third of the
+    // ribbon's thickness, so the shell can never grow wider than the thing it
+    // is outlining when the ribbon is seen edge-on.
+    const shell = addOutline(m, {
+      widthPx: 1.5,
+      color: PAL.ink,
+      minWorld: 0.0012,
+      maxWorld: 0.007,
+    });
     shell.frustumCulled = false;
     this.inkShells.push(shell);
     // The constructor's ink pass walks the whole tree; this mesh is already done.
@@ -1132,7 +1316,13 @@ export class Rider {
    * Side effect: `_qDistal` is left holding the distal bone's orientation in
    * base space, which the leg code uses to keep the sole flat.
    *
-   * Returns how far the target was out of reach, in metres.
+   * Returns how far the target was beyond `comfort` × the chain length, in
+   * metres. `comfort` is NOT the reach limit (that is the fixed 0.985 below) —
+   * it is the extension the body should be *driven* toward by whatever loop
+   * consumes this number. Reporting over-extension against the hard limit is
+   * what left the arms ruler-straight: the torso's reach integrator settles
+   * wherever the error is zero, and zero error at 98.5% extension is a locked
+   * elbow. Ask for 88% and the same loop settles on a ~120° elbow instead.
    */
   private solveIK(
     upper: Object3D,
@@ -1142,7 +1332,8 @@ export class Rider {
     target: Vector3,
     poleX: number,
     poleY: number,
-    poleZ: number
+    poleZ: number,
+    comfort = 0.985
   ): number {
     _ikTarget.copy(target).sub(upper.position);
     let d = _ikTarget.length();
@@ -1182,7 +1373,7 @@ export class Rider {
     _qc.copy(_qa).invert().multiply(_qb);
     fore.quaternion.copy(_qc);
 
-    return Math.max(0, d - dMax);
+    return Math.max(0, d - (l1 + l2) * Math.min(comfort, 0.985));
   }
 
   // -------------------------------------------------------------------------
@@ -1214,7 +1405,12 @@ export class Rider {
     // a few centimetres off the bar; integrating drives the steady-state error
     // to ~0 and the 0.6/s leak walks the correction back out once the hands can
     // reach again. Gain 5 keeps the crossover well under the ω = 10 spring below.
-    this.reachAccum = clamp(this.reachAccum + (this.reachErr * 5 - this.reachAccum * 0.6) * dt, 0, 0.5);
+    // The ceiling is 0.18 m, not 0.5: `reachErr` is now measured against the
+    // COMFORT extension rather than the hard reach limit, so it is non-zero in
+    // ordinary riding and the loop is doing real work every frame. 0.18 caps the
+    // hip slide at ~21 cm, which is inside the saddle; 0.5 would have posted the
+    // rider onto the cowling if the equilibrium were ever unreachable.
+    this.reachAccum = clamp(this.reachAccum + (this.reachErr * 5 - this.reachAccum * 0.6) * dt, 0, 0.18);
     this.spring(CH_REACH, this.reachAccum, 10, dt);
 
     // Landing: `landImpact` is a one-frame impulse (main.ts clears boat.events
@@ -1261,6 +1457,10 @@ export class Rider {
     // fighting the very thing the celebration is trying to do.
     const reachPitch = reach * (1 - celeb * 0.8);
 
+    // Idle amplitudes are ~3× what they were. At 0.012 rad the sway was 0.7° —
+    // below the resolution of a 150 px-tall character, which is why three frames
+    // of a stationary grid looked byte-identical. 0.04 rad is 2.3°: still a long
+    // way from mime, but it moves a shoulder by a visible pixel or two.
     const pelvisPitch =
       REST.pelvisX +
       sp * 0.26 -
@@ -1271,7 +1471,7 @@ export class Rider {
       celeb * 0.15 +
       reachPitch * 0.45 +
       bobCounter * 0.25 +
-      swayA * 0.012;
+      swayA * 0.038;
 
     const spinePitch =
       REST.spineX +
@@ -1283,7 +1483,7 @@ export class Rider {
       celeb * 0.2 +
       reachPitch * 0.75 +
       bobCounter * 0.4 +
-      breathe * 0.014;
+      breathe * 0.042;
 
     const chestPitch =
       REST.chestX +
@@ -1295,14 +1495,14 @@ export class Rider {
       celeb * 0.19 +
       reachPitch * 0.95 +
       bobCounter * 0.4 +
-      breathe * 0.01;
+      breathe * 0.03;
 
     // ---- torso roll ---------------------------------------------------------
     // Rotation about +Z lifts +X, i.e. leans LEFT — so a right lean is negative.
     const pelvisRoll = lean * 0.09; // hips resist, they carry the counterweight
-    const spineRoll = -lean * 0.24 + drift * 0.6 + swayB * 0.01;
-    const chestRoll = -lean * 0.3 + drift + swayA * 0.008;
-    const torsoYaw = lean * 0.1 + swayB * 0.012; // shoulders open into the turn
+    const spineRoll = -lean * 0.24 + drift * 0.6 + swayB * 0.032;
+    const chestRoll = -lean * 0.3 + drift + swayA * 0.026;
+    const torsoYaw = lean * 0.1 + swayB * 0.04; // shoulders open into the turn
 
     this.pelvis.rotation.set(pelvisPitch, -lean * 0.05, pelvisRoll);
     this.spine.rotation.set(spinePitch, torsoYaw * 0.4, spineRoll);
@@ -1428,7 +1628,20 @@ export class Rider {
 
       over = Math.max(
         over,
-        this.solveIK(this.upperArm[i], this.foreArm[i], L_UPPER, L_FORE, _v0, poleX, poleY, poleZ)
+        this.solveIK(
+          this.upperArm[i],
+          this.foreArm[i],
+          L_UPPER,
+          L_FORE,
+          _v0,
+          poleX,
+          poleY,
+          poleZ,
+          // 0.88 of (0.29 + 0.27) is a 49 cm reach, which by the law of cosines
+          // is a 121° elbow — the bend a rider actually holds on a bar. The
+          // celebrating arm is excused: a raised fist is allowed to be straight.
+          armCel > 0.5 ? 0.985 : ARM_COMFORT
+        )
       );
     }
     // Feed the over-extension back into next frame's torso reach. One frame of
@@ -1593,11 +1806,22 @@ export class Rider {
       const py = this.sp[o + 1];
       const pz = this.sp[o + 2];
 
-      // Corner order must match buildScarf's index buffer: (+w,−t) (−w,−t)
-      // (−w,+t) (+w,+t) — i.e. CCW seen from +tangent.
+      // Corner order must match buildScarf's index buffer: (+w,+t) (−w,+t)
+      // (−w,−t) (+w,−t) — i.e. CCW seen from +tangent, the same handedness
+      // rule `loft` obeys.
+      //
+      // This used to run the other way round, which inverted every triangle in
+      // the ribbon. Two symptoms, one cause: the material needed DoubleSide to
+      // be visible at all, and — the visible bug — the inverted-hull ink drew
+      // the ribbon's NEAR surface (a back-face pass over reversed geometry
+      // finds the near side) pushed toward the camera, so the shell covered the
+      // scarf completely and it rendered as a solid black rag off the shoulder.
+      // Verified by hand on a unit ring: with (+w,+t) first, the face between
+      // corners 0 and 1 has outward normal +nrm, and both existing end caps
+      // still face ∓tangent correctly.
       for (let k = 0; k < 4; k++) {
         const sw = k === 0 || k === 3 ? 1 : -1;
-        const st = k >= 2 ? 1 : -1;
+        const st = k >= 2 ? -1 : 1;
         const v = (i * 4 + k) * 3;
         pos[v] = px + _v1.x * w * sw + _v2.x * th * st;
         pos[v + 1] = py + _v1.y * w * sw + _v2.y * th * st;

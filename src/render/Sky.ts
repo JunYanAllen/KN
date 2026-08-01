@@ -2,6 +2,7 @@ import {
   AdditiveBlending,
   BackSide,
   ClampToEdgeWrapping,
+  Color,
   DataTexture,
   DoubleSide,
   Group,
@@ -34,7 +35,7 @@ import { PAL, SUN_DIR } from '../core/Palette';
  *    2. SUN     one additive quad. Hard disc + concentric hard rings + straight
  *               tapered spikes. Everything is a *shape* with an edge; nothing
  *               in it is a falloff, because a falloff reads as a photograph.
- *    3. CLOUDS  one instanced draw of ~46 camera-facing quads sampling a 2x2
+ *    3. CLOUDS  one instanced draw of 16 large camera-facing quads sampling a 2x2
  *               atlas of procedurally baked cloud silhouettes. The atlas stores
  *               a signed distance + a 2-D silhouette normal, which is what lets
  *               the fragment shader put a hard warm rim on whichever side of
@@ -64,7 +65,13 @@ const CLOUD_RADIUS = 1700;
 /** Half-size of the sun's flare card, in world units at SUN_RADIUS. */
 const SUN_HALF = 300; // atan(300/1745) ~ 9.8 deg of flare, ~1.6 deg of actual disc
 
-const CLOUD_COUNT = 46;
+/**
+ * Sixteen, not forty-six. The old sky was a scattering of small shapes that
+ * added nothing but texture; a cel sky is a handful of BIG silhouettes placed
+ * against a flat gradient. At the sizes below a typical 65-degree-wide frame
+ * holds three or four of them, which is a composition rather than a stipple.
+ */
+const CLOUD_COUNT = 16;
 
 /** Cloud atlas: 2x2 cells of 128px. One texture, therefore one draw call. */
 const CELL = 128;
@@ -75,6 +82,33 @@ const SDF_RANGE = 0.14;
 const FIELD_T = 0.16;
 
 const SUN = new Vector3(SUN_DIR.x, SUN_DIR.y, SUN_DIR.z).normalize();
+
+/**
+ * The seven flat sky tones, horizon (0) to zenith (6).
+ *
+ * PAL.skyTop / skyMid / skyHorizon are the three anchors, but a three-stop lerp
+ * evaluated over the compressed elevation curve only ever reached skyMid inside
+ * the frame — the deep blue lived above 50 degrees where the camera never
+ * looks, and the visible sky was one pale wash between skyHorizon and skyMid
+ * with barely a step in it. So the ramp is authored as seven explicit tones
+ * that reach the deep end EARLY: band 3 is skyMid at 16 degrees and band 5 is
+ * already past skyTop. Band 0 is PAL.skyHorizon exactly, unmodified, because
+ * the ocean's aerial-perspective fade lands on that value and the two have to
+ * meet without a seam.
+ *
+ * The separation between adjacent bands is roughly 0.13 in linear luminance —
+ * three to four times the old spacing — which is what makes the steps read as
+ * steps rather than as a compression artefact.
+ */
+const SKY_BANDS = [
+  PAL.skyHorizon.getHex(), // 0  horizon haze — must match the water's fog tint
+  0x9fe0fb, // 1
+  0x72c6f4, // 2
+  0x48a6ea, // 3  ~PAL.skyMid
+  0x2786db, // 4
+  0x1263c7, // 5  ~PAL.skyTop
+  0x0a45a4, // 6  zenith
+];
 
 // Module-scope scratch. Nothing in update() or sunNDC() allocates.
 const _m4 = /*@__PURE__*/ new Matrix4();
@@ -100,32 +134,44 @@ function mulberry32(seed: number): () => number {
  * (+y is DOWN, as canvas has it). Flat-ish bottoms, lumpy tops: the silhouette
  * is the entire read of a cel cloud, so it is authored, not randomised.
  * Triplets of [cx, cy, r].
+ *
+ * ALL FOUR ARE NOW ONE FAMILY, and every blob overlaps its neighbours.
+ * The previous set contained a "scattered pair" and a "long thin streak" whose
+ * circles were 0.12 apart with radii of 0.05-0.08 — and an isolated blob's own
+ * contour at the field threshold sits at 0.63 of its radius, so those two never
+ * merged. They baked as rows of separate dots and rendered as the popcorn
+ * specks that made the sky read as noise. The rule the shapes below obey is
+ * that neighbouring centres are never further apart than 1.15x the smaller
+ * radius, which guarantees a single connected silhouette per cell.
  */
 const CLOUD_SHAPES: number[][] = [
-  // 0 — wide flat-bottomed cumulus
+  // 0 — wide flat-bottomed cumulus, the workhorse
   [
-    0.5, 0.58, 0.19, 0.31, 0.62, 0.15, 0.69, 0.62, 0.155, 0.42, 0.46, 0.145, 0.6, 0.475, 0.135,
-    0.51, 0.375, 0.105, 0.2, 0.655, 0.105, 0.81, 0.655, 0.1, 0.5, 0.665, 0.15,
+    0.18, 0.66, 0.115, 0.3, 0.68, 0.13, 0.44, 0.68, 0.135, 0.58, 0.68, 0.135, 0.72, 0.67, 0.12,
+    0.84, 0.655, 0.1, 0.36, 0.55, 0.135, 0.52, 0.53, 0.15, 0.66, 0.565, 0.12, 0.45, 0.42, 0.115,
+    0.58, 0.44, 0.1, 0.5, 0.33, 0.085,
   ],
-  // 1 — towering cumulus, tall and narrow
+  // 1 — towering cumulus: same language, stacked instead of spread
   [
-    0.5, 0.68, 0.165, 0.38, 0.62, 0.13, 0.62, 0.6, 0.135, 0.49, 0.5, 0.14, 0.58, 0.4, 0.115, 0.44,
-    0.34, 0.1, 0.53, 0.26, 0.082, 0.3, 0.7, 0.1, 0.72, 0.7, 0.095,
+    0.3, 0.72, 0.115, 0.44, 0.73, 0.13, 0.58, 0.72, 0.125, 0.7, 0.7, 0.1, 0.4, 0.6, 0.13, 0.55,
+    0.58, 0.135, 0.46, 0.47, 0.125, 0.6, 0.46, 0.105, 0.5, 0.36, 0.105, 0.62, 0.35, 0.08, 0.54,
+    0.26, 0.075,
   ],
-  // 2 — a scattered pair with a real gap between them
+  // 2 — long low bank: one continuous mass with two heads
   [
-    0.3, 0.6, 0.115, 0.2, 0.65, 0.085, 0.4, 0.645, 0.09, 0.68, 0.56, 0.1, 0.78, 0.6, 0.075, 0.6,
-    0.615, 0.07,
+    0.12, 0.62, 0.09, 0.22, 0.6, 0.11, 0.33, 0.585, 0.12, 0.44, 0.6, 0.1, 0.55, 0.615, 0.095, 0.66,
+    0.6, 0.11, 0.77, 0.585, 0.115, 0.87, 0.61, 0.09, 0.28, 0.5, 0.095, 0.5, 0.53, 0.075, 0.72, 0.49,
+    0.1,
   ],
-  // 3 — long thin streak
+  // 3 — big compact anvil
   [
-    0.14, 0.55, 0.062, 0.26, 0.53, 0.075, 0.38, 0.555, 0.068, 0.5, 0.52, 0.082, 0.62, 0.55, 0.07,
-    0.74, 0.535, 0.062, 0.86, 0.56, 0.05, 0.44, 0.6, 0.06, 0.58, 0.6, 0.055,
+    0.28, 0.66, 0.13, 0.44, 0.68, 0.145, 0.6, 0.665, 0.14, 0.73, 0.64, 0.11, 0.36, 0.54, 0.14, 0.53,
+    0.52, 0.155, 0.68, 0.545, 0.12, 0.44, 0.4, 0.125, 0.6, 0.41, 0.115, 0.52, 0.3, 0.1,
   ],
 ];
 
 /** Per-cell rim/shade band width multiplier — see the instance setup below. */
-const CLOUD_BAND_SCALE = [1.0, 1.0, 0.55, 0.4];
+const CLOUD_BAND_SCALE = [1.0, 0.95, 0.72, 1.05];
 
 /**
  * Bakes the four silhouettes into one RGBA texture:
@@ -142,11 +188,20 @@ const CLOUD_BAND_SCALE = [1.0, 1.0, 0.55, 0.4];
  * side. A binary alpha mask can answer neither, and screen-space derivatives of
  * a binary mask are garbage.
  *
- * The field itself is built the way the brief asks for: overlapping circles
+ * The shape itself is built the way the brief asks for: overlapping circles
  * unioned in canvas 2D (additive radial gradients = a metaball field) and then
- * thresholded to a hard edge. The distance is a first-order estimate,
- * (T - f) / |grad f|, which is accurate exactly where we use it: within a dozen
- * pixels of the boundary.
+ * thresholded to a hard edge.
+ *
+ * The distance is then an EXACT Euclidean distance transform of that hard mask,
+ * not the first-order estimate (T - f) / |grad f| this used to run. The estimate
+ * is only valid within a few pixels of the boundary; everywhere else it depends
+ * on the local steepness of the metaball field, and in the shallow pockets
+ * between two barely-overlapping blobs it reported "a couple of pixels inside"
+ * for texels that were forty pixels deep. The fragment shader then painted its
+ * shade band there, which is what put the blue speckle all over the interiors
+ * of the clouds. Danielsson's 8SSEDT gives the true distance in two sweeps, and
+ * for free it gives the vector to the nearest boundary point — which is a
+ * better silhouette normal than the field gradient ever was.
  */
 function buildCloudAtlas(): DataTexture {
   const cv = document.createElement('canvas');
@@ -189,12 +244,56 @@ function buildCloudAtlas(): DataTexture {
   const src = g.getImageData(0, 0, ATLAS, ATLAS).data;
   const out = new Uint8Array(ATLAS * ATLAS * 4);
 
-  // Field lookup with cell-local clamping: sampling across a cell border would
-  // splice two unrelated clouds together in the gradient.
-  const field = (px: number, py: number, ox: number, oy: number) => {
-    const x = Math.min(ox + CELL - 1, Math.max(ox, px));
-    const y = Math.min(oy + CELL - 1, Math.max(oy, py));
-    return src[(y * ATLAS + x) * 4] / 255;
+  // Scratch for the two distance grids. Each texel stores the vector, in
+  // pixels, from itself to the nearest seed texel. FAR is finite rather than
+  // Infinity so the squared comparisons stay ordinary floats.
+  const N = CELL * CELL;
+  const FAR = 1e5;
+  const ax = new Float32Array(N); // -> nearest INSIDE texel
+  const ay = new Float32Array(N);
+  const bx = new Float32Array(N); // -> nearest OUTSIDE texel
+  const by = new Float32Array(N);
+
+  /**
+   * Danielsson's 8SSEDT: two raster sweeps, each relaxing a texel against the
+   * four neighbours the sweep has already finalised plus one backward step
+   * along the row. Exact for all but a handful of pathological configurations,
+   * and none of those are reachable from a union of discs.
+   */
+  const sweep = (vx: Float32Array, vy: Float32Array) => {
+    const relax = (x: number, y: number, ox2: number, oy2: number) => {
+      const nx = x + ox2;
+      const ny = y + oy2;
+      // Cell-local: never read across a cell border, or two unrelated clouds
+      // would end up seeding each other's distance field.
+      if (nx < 0 || ny < 0 || nx >= CELL || ny >= CELL) return;
+      const i = y * CELL + x;
+      const j = ny * CELL + nx;
+      const cx = vx[j] + ox2;
+      const cy = vy[j] + oy2;
+      if (cx * cx + cy * cy < vx[i] * vx[i] + vy[i] * vy[i]) {
+        vx[i] = cx;
+        vy[i] = cy;
+      }
+    };
+    for (let y = 0; y < CELL; y++) {
+      for (let x = 0; x < CELL; x++) {
+        relax(x, y, -1, 0);
+        relax(x, y, 0, -1);
+        relax(x, y, -1, -1);
+        relax(x, y, 1, -1);
+      }
+      for (let x = CELL - 1; x >= 0; x--) relax(x, y, 1, 0);
+    }
+    for (let y = CELL - 1; y >= 0; y--) {
+      for (let x = CELL - 1; x >= 0; x--) {
+        relax(x, y, 1, 0);
+        relax(x, y, 0, 1);
+        relax(x, y, 1, 1);
+        relax(x, y, -1, 1);
+      }
+      for (let x = 0; x < CELL; x++) relax(x, y, -1, 0);
+    }
   };
 
   for (let cell = 0; cell < 4; cell++) {
@@ -203,36 +302,83 @@ function buildCloudAtlas(): DataTexture {
 
     for (let ly = 0; ly < CELL; ly++) {
       for (let lx = 0; lx < CELL; lx++) {
-        const px = ox + lx;
-        const py = oy + ly;
-        const f = field(px, py, ox, oy);
+        const i = ly * CELL + lx;
+        const f = src[((oy + ly) * ATLAS + ox + lx) * 4] / 255;
+        if (f >= FIELD_T) {
+          ax[i] = 0;
+          ay[i] = 0;
+          bx[i] = FAR;
+          by[i] = FAR;
+        } else {
+          ax[i] = FAR;
+          ay[i] = FAR;
+          bx[i] = 0;
+          by[i] = 0;
+        }
+      }
+    }
+    sweep(ax, ay);
+    sweep(bx, by);
 
-        // Central differences, converted from per-pixel to per-cell-UV.
-        const dfdx = (field(px + 1, py, ox, oy) - field(px - 1, py, ox, oy)) * 0.5 * CELL;
-        // Canvas +y is down; the output texture's +v is up (we write rows
-        // bottom-up below), so the v-derivative is the negated y-derivative.
-        const dfdv = -(field(px, py + 1, ox, oy) - field(px, py - 1, ox, oy)) * 0.5 * CELL;
+    // Cell-local field lookup, for the sub-texel refinement below.
+    const field = (px: number, py: number) => {
+      const x = Math.min(CELL - 1, Math.max(0, px));
+      const y = Math.min(CELL - 1, Math.max(0, py));
+      return src[((oy + y) * ATLAS + ox + x) * 4] / 255;
+    };
 
-        const gm = Math.hypot(dfdx, dfdv);
-        // Floor the gradient magnitude: in the saturated interior and in the
-        // empty margin the field is flat, and dividing by ~0 there produces
-        // infinities that would poison the linear filtering near the edge.
-        const gsafe = Math.max(gm, 1.0);
+    for (let ly = 0; ly < CELL; ly++) {
+      for (let lx = 0; lx < CELL; lx++) {
+        const i = ly * CELL + lx;
+        const inside = ax[i] === 0 && ay[i] === 0;
+        // Outward, in canvas pixels: for an inside texel that is the step to
+        // the nearest outside texel; for an outside texel it is the reverse of
+        // the step to the nearest inside texel.
+        const vx = inside ? bx[i] : -ax[i];
+        const vy = inside ? by[i] : -ay[i];
+        const len = Math.hypot(vx, vy);
+        // The mask edge sits half a texel outside the last inside texel, so
+        // subtract 0.5 to put d == 0 on the actual silhouette.
+        let dPx = (inside ? -len : len) - 0.5;
 
-        let d = (FIELD_T - f) / gsafe; // < 0 inside
-        d = Math.max(-SDF_RANGE, Math.min(SDF_RANGE, d));
+        // ---- SUB-TEXEL REFINEMENT ------------------------------------------
+        // The EDT is exact but it is quantised to whole texels, and the cards
+        // magnify the atlas about tenfold, so a raw EDT contour renders as a
+        // visible staircase. Within a couple of texels of the boundary the
+        // metaball field's own first-order estimate, (T - f) / |grad f|, is
+        // sub-texel accurate and perfectly smooth — it is only unreliable
+        // further in, where the field flattens out. So use the estimate at the
+        // edge, the transform everywhere else, and cross-fade between them.
+        const gx2 = (field(lx + 1, ly) - field(lx - 1, ly)) * 0.5;
+        const gy2 = (field(lx, ly + 1) - field(lx, ly - 1)) * 0.5;
+        const gm = Math.hypot(gx2, gy2);
+        if (gm > 2e-3) {
+          const est = Math.max(-3, Math.min(3, (FIELD_T - field(lx, ly)) / gm));
+          const t = Math.min(1, Math.max(0, (Math.abs(dPx) - 0.6) / 1.4));
+          dPx = est * (1 - t) + dPx * t;
+        }
+        const d = Math.max(-SDF_RANGE, Math.min(SDF_RANGE, dPx / CELL));
 
+        // The EDT's direction is quantised the same way, so prefer the field
+        // gradient (outward = direction of decreasing field) wherever it is
+        // well conditioned, which covers the whole width of the rim and shade
+        // bands. Deep in the interior the field is flat and the transform's
+        // direction is the only one left.
         let nx = 0;
         let nv = 1;
-        if (gm > 1e-4) {
-          // Outward = direction of *decreasing* field.
-          nx = -dfdx / gm;
-          nv = -dfdv / gm;
+        if (gm > 2e-3) {
+          nx = -gx2 / gm;
+          // Canvas +y is down; the output texture's +v is up (rows are written
+          // bottom-up below), so the v component is negated.
+          nv = gy2 / gm;
+        } else if (len > 1e-4 && len < FAR * 0.5) {
+          nx = vx / len;
+          nv = -vy / len;
         }
 
         // Write bottom-up so the DataTexture (flipY = false) comes out upright.
         const oRow = CELL - 1 - ly;
-        const o = ((oy + oRow) * ATLAS + px) * 4;
+        const o = ((oy + oRow) * ATLAS + ox + lx) * 4;
         out[o + 0] = Math.round((d / SDF_RANGE) * 0.5 * 255 + 127.5);
         out[o + 1] = Math.round(nx * 127.5 + 127.5);
         out[o + 2] = Math.round(nv * 127.5 + 127.5);
@@ -271,52 +417,81 @@ void main() {
 const DOME_FRAG = /* glsl */ `
 precision highp float;
 
-uniform vec3  uTop;
-uniform vec3  uMid;
-uniform vec3  uHorizon;
+uniform vec3  uBand[7];      // horizon -> zenith, seven authored flat tones
 uniform vec3  uSunTint;
 uniform vec3  uSunDir;
+uniform vec3  uFwd;          // camera's HORIZONTAL forward, world space
 uniform float uBands;
 
 varying vec3 vDir;
 
+/**
+ * Pick a band colour by index. Written as a constant-bounds loop with a loop
+ * counter as the subscript because GLSL ES 1.00 only permits constant-index
+ * expressions into uniform arrays in the fragment stage — a plain uBand[int(i)]
+ * fails to compile on a strict driver.
+ */
+vec3 bandColour(float i) {
+  vec3 c = uBand[0];
+  for (int k = 1; k < 7; k++) {
+    if (float(k) <= i + 0.5) c = uBand[k];
+  }
+  return c;
+}
+
 void main() {
   vec3 dir = normalize(vDir);
 
-  // Elevation 0..1. The pow() crowds the bands toward the horizon, which is
-  // where the camera actually looks in a boat game — an even split puts five of
-  // the seven bands directly overhead where nobody sees them.
-  float e = pow(clamp(dir.y, 0.0, 1.0), 0.62);
+  // --- BAND COORDINATE: PLANES THROUGH THE EYE, NOT CONES -------------------
+  // The old version banded on dir.y, i.e. on true elevation. A constant-
+  // elevation ring is a CONE around the vertical, and a cone through the eye
+  // projects to a conic section — so every band boundary bowed upward toward
+  // the frame edges by tan(e) * (1/cos(azimuth) - 1), which at this 56 degree
+  // field of view is nearly a fifth of the frame height on the upper bands.
+  // That is the curved arcing the sky was showing, and it reads as the skydome
+  // sphere leaking through rather than as drawn bands.
+  //
+  // Dividing by the forward component instead gives dot(dir, up - c*fwd) == 0:
+  // a family of PLANES through the eye, every one of which projects to a dead
+  // straight horizontal line. The planes contain the camera's horizontal right
+  // axis, so they still sit on the world horizon and still slide correctly when
+  // the camera pitches; only yaw rotates the family, about the vertical axis,
+  // where a rotationally symmetric gradient cannot show it.
+  float fwd = max(dot(dir, uFwd), 0.10);
+  float tanE = max(dir.y, 0.0) / fwd;
 
-  // --- QUANTISE THE GRADIENT PARAMETER, NOT THE COLOUR --------------------
-  // Snapping the parameter and *then* evaluating the ramp gives exactly uBands
-  // flat plateaus of the true gradient. Snapping the colour instead would give
-  // per-channel steps that land at different elevations and read as banding
-  // artefacts rather than as deliberate bands.
+  // Hyperbolic compression: 0 at the horizon, 0.5 at 21.8 degrees, 1 at the
+  // zenith. With seven bands the boundaries land at 3.8 / 9.1 / 16.7 / 28.1 /
+  // 45 / 67 degrees, so four or five of them fall inside a frame that is
+  // looking at the water — instead of the old curve, which spent five of its
+  // seven bands overhead where nobody sees them and left the visible sky as one
+  // pale wash between skyHorizon and skyMid.
+  float e = tanE / (tanE + 0.40);
+
+  // --- QUANTISE THE GRADIENT PARAMETER, NOT THE COLOUR ----------------------
   float f = e * uBands;
   float idx = floor(f);
   float frac = f - idx;
   // fwidth(f) is the change in band-index across one pixel, so this smoothstep
-  // is a strictly ~1px soft edge on a 1800m dome. Any wider and it stops
-  // reading as a hard band; with nothing at all a near-horizontal band edge
-  // stair-steps across half the screen.
-  float aa = clamp(fwidth(f) * 0.9, 0.0005, 0.5);
-  float eb = (idx + smoothstep(1.0 - aa, 1.0, frac)) / uBands;
+  // is a strictly ~1px soft edge. Any wider and it stops reading as a hard
+  // band; with nothing at all a near-horizontal band edge stair-steps across
+  // half the screen.
+  float aa = clamp(fwidth(f) * 0.9, 0.0004, 0.5);
+  vec3 col = mix(bandColour(idx), bandColour(idx + 1.0), smoothstep(1.0 - aa, 1.0, frac));
 
-  // Three-stop ramp evaluated at the quantised parameter.
-  vec3 col = eb < 0.5
-    ? mix(uHorizon, uMid, eb * 2.0)
-    : mix(uMid, uTop, (eb - 0.5) * 2.0);
-
-  // --- GRAPHIC SUN WASH ----------------------------------------------------
+  // --- GRAPHIC SUN WASH -----------------------------------------------------
   // Two hard concentric lifts around the sun instead of an exponential glow.
-  // Thresholds are cos(angle): 0.90 ~ 26 deg, 0.66 ~ 49 deg.
+  // Thresholds are cos(angle): 0.955 ~ 17 deg, 0.90 ~ 26 deg.
+  //
+  // A third, 52 degree step used to sit outside these. Because the sun is 46
+  // degrees up and off to the side, that outer cone swept a big circle right
+  // across the top of the frame with the sun itself out of shot, and a lone
+  // unexplained arc across the sky is indistinguishable from the skydome
+  // seam the art review was already complaining about. Kept tight, the steps
+  // read as the corona of a sun that is just out of frame, which is what they
+  // are for.
   float sd = dot(dir, normalize(uSunDir));
-  col += uSunTint * (step(0.66, sd) * 0.045 + step(0.90, sd) * 0.075);
-
-  // Below the water line the dome is only ever visible as a sliver behind the
-  // horizon fade, so hold it at the horizon colour rather than mirroring.
-  col = mix(uHorizon, col, step(0.0, dir.y));
+  col += uSunTint * (step(0.90, sd) * 0.03 + step(0.955, sd) * 0.11);
 
   gl_FragColor = vec4(col, 1.0);
 }
@@ -516,7 +691,7 @@ void main() {
   float ndl = dot(n, vSun2);
   float inset = -d;                        // how far inside the silhouette
 
-  // --- three flat tones, every one selected with step() --------------------
+  // --- flat tones, every one selected with step() --------------------------
   vec3 col = uLit;
 
   // Pale-blue band hugging the anti-sun edge. Constant width in cloud space,
@@ -524,16 +699,24 @@ void main() {
   float shadeW = uShadeW * vBand;
   float shade = step(inset, shadeW) * step(ndl, -0.10);
   // A thicker band directly opposite the sun — the cloud's own underside.
-  float deep  = step(inset, shadeW * 2.3) * step(ndl, -0.62);
-  col = mix(col, uShade, max(shade, deep));
+  float deep  = step(inset, shadeW * 1.8) * step(ndl, -0.62);
+  // ...and a flat shaded belly regardless of where the sun is. Cumulus read as
+  // solid because the bottom of the mass is in its own shadow, and keying that
+  // purely off the sun direction loses it whenever the light is roughly along
+  // the view. n.y is the silhouette normal's vertical component in cloud space,
+  // and the cards carry only a few degrees of roll, so it is the world down.
+  float belly = step(inset, shadeW * 1.45) * step(n.y, -0.42);
+  col = mix(col, uShade, max(max(shade, deep), belly));
 
   // Warm rim on the sun side, drawn last so it wins over the shade band.
   float rim = step(inset, uRimW * vBand) * step(0.30, ndl);
   col = mix(col, uRim, rim);
 
   // Aerial perspective, quantised to three steps so it never smears the tones.
+  // Held to 0.30 (was 0.55): at 0.55 the low clouds — which is most of them —
+  // washed most of the way to the horizon tint and stopped reading as shapes.
   float h = floor(vHaze * 3.0 + 0.5) / 3.0;
-  col = mix(col, uHazeColor, h * 0.55);
+  col = mix(col, uHazeColor, h * 0.30);
 
   gl_FragColor = vec4(col, mask * vAlpha);
 }
@@ -552,6 +735,8 @@ export class Sky {
 
   private readonly _cloudMat: ShaderMaterial;
   private readonly _atlas: DataTexture;
+  /** Live reference to the dome's uFwd uniform value. */
+  private readonly _domeFwd: Vector3;
 
   constructor() {
     const group = new Group();
@@ -565,11 +750,10 @@ export class Sky {
     const domeGeo = new SphereGeometry(DOME_RADIUS, 40, 24);
     const domeMat = new ShaderMaterial({
       uniforms: {
-        uTop: { value: PAL.skyTop.clone() },
-        uMid: { value: PAL.skyMid.clone() },
-        uHorizon: { value: PAL.skyHorizon.clone() },
+        uBand: { value: SKY_BANDS.map((h) => new Color(h)) },
         uSunTint: { value: PAL.sun.clone() },
         uSunDir: { value: SUN.clone() },
+        uFwd: { value: new Vector3(0, 0, -1) },
         uBands: { value: 7.0 },
       },
       vertexShader: DOME_VERT,
@@ -581,6 +765,7 @@ export class Sky {
       depthTest: false,
       fog: false,
     });
+    this._domeFwd = domeMat.uniforms.uFwd.value as Vector3;
     this.dome = new Mesh(domeGeo, domeMat);
     this.dome.name = 'SkyDome';
     this.dome.renderOrder = -1000;
@@ -649,20 +834,34 @@ export class Sky {
     /** ~2.9 rad/hr: a cloud crosses the 56 deg FOV in about five minutes. */
     const BASE_DRIFT = 0.0031;
 
+    /**
+     * Elevation tiers, in radians, cycled rather than drawn at random. A random
+     * elevation gives an even stipple; a repeating low/high/mid pattern gives
+     * the sky a near bank and a far bank, which is a composition. The floor of
+     * 0.17 rad (9.7 deg) is set so that even the largest card's silhouette —
+     * whose bottom sits ~0.44 of a half-height below centre — clears the
+     * horizon line instead of being sliced by it.
+     */
+    const TIERS = [0.19, 0.42, 0.26, 0.55, 0.17, 0.34, 0.23, 0.47];
+
     for (let i = 0; i < CLOUD_COUNT; i++) {
       // Even azimuthal spread with jitter — pure random leaves obvious gaps.
-      const az = (i / CLOUD_COUNT) * TAU + (rnd() - 0.5) * (TAU / CLOUD_COUNT) * 1.6;
-      // Biased low: real cloudscapes pile up toward the horizon, and that is
-      // also where the camera spends its time.
-      const el = 0.045 + Math.pow(rnd(), 1.8) * 0.62;
+      const az = (i / CLOUD_COUNT) * TAU + (rnd() - 0.5) * (TAU / CLOUD_COUNT) * 1.1;
+      const el = TIERS[i % TIERS.length] * (0.9 + rnd() * 0.2);
 
       // Higher clouds are nearer the viewer in a real sky, so draw them bigger.
-      const sizeBias = 0.7 + el * 0.9;
-      const halfW = (95 + rnd() * 150) * sizeBias;
-      // Keep the quad close to square: the baked silhouettes already carry
-      // their own aspect (the cumulus fills ~0.82 x 0.47 of its cell), and
-      // squashing the card on top of that flattens them into pancakes.
-      const halfH = halfW * (0.82 + rnd() * 0.2);
+      const sizeBias = 0.82 + el * 0.5;
+      // BIG. Note the name is a lie inherited from the original: PlaneGeometry
+      // spans -0.5..0.5, so this value is the card's FULL width, not its half
+      // width — which is most of why the old clouds were specks. At
+      // CLOUD_RADIUS = 1700 the range below is 15 to 33 degrees across, and the
+      // silhouette fills about 88% of the card, so three of them make a
+      // skyline. The old 95-245 came out at 2 to 10 degrees.
+      const halfW = (500 + rnd() * 420) * sizeBias;
+      // Wider than tall. The baked silhouettes fill ~0.88 x 0.54 of their cell,
+      // so at 0.80 the drawn cloud comes out around 2:1 — a cumulus bank rather
+      // than a ball of cotton.
+      const halfH = halfW * 0.8;
 
       a[i * 4 + 0] = az;
       a[i * 4 + 1] = el;
@@ -678,7 +877,9 @@ export class Sky {
       b[i * 4 + 3] = ((cell / 2) | 0) * 0.5;
 
       c[i * 4 + 0] = rnd() < 0.5 ? -1 : 1;
-      c[i * 4 + 1] = 0.88 + rnd() * 0.12;
+      // Opaque. A cel cloud is a filled shape with an edge; letting the sky
+      // through at 88% turns the edge into a wash and the fill into a tint.
+      c[i * 4 + 1] = 1.0;
       // Band width scale per silhouette. Measured against the baked distance
       // field: at full width the rim covers 27% of the big cumulus interiors
       // but 73% of the thin streak, which stops reading as a rim and starts
@@ -702,8 +903,12 @@ export class Sky {
         uRim: { value: PAL.cloudRim.clone() },
         uHazeColor: { value: PAL.skyHorizon.clone() },
         uRange: { value: SDF_RANGE },
-        uShadeW: { value: 0.048 },
-        uRimW: { value: 0.030 },
+        // Widened along with the clouds themselves: at the old widths a band
+        // on a card three times the size still covered the same fraction of
+        // the silhouette, but the *rim* needs to read as a deliberate stroke,
+        // so it gets a third more.
+        uShadeW: { value: 0.042 },
+        uRimW: { value: 0.04 },
       },
       vertexShader: CLOUD_VERT,
       fragmentShader: CLOUD_FRAG,
@@ -727,8 +932,20 @@ export class Sky {
     // the sun around the sky.
     this.object.position.copy(camera.position);
     // Drift is entirely time-driven inside the vertex shader — one uniform
-    // write per frame animates all 46 clouds with no CPU-side matrix churn.
+    // write per frame animates every cloud with no CPU-side matrix churn.
     this._cloudMat.uniforms.uTime.value = t;
+
+    // The dome's band planes are anchored to the camera's HORIZONTAL forward
+    // (see DOME_FRAG). Flattening the view direction is what keeps the bands on
+    // the world horizon when the camera pitches instead of pinning them to the
+    // screen. Looking straight up or down leaves no horizontal component at
+    // all, so fall back to the previous frame's axis rather than dividing by
+    // zero and flashing the whole sky one colour.
+    camera.getWorldDirection(_v3);
+    _v3.y = 0;
+    if (_v3.lengthSq() > 1e-6) {
+      (this._domeFwd as Vector3).copy(_v3.normalize());
+    }
   }
 
   /**

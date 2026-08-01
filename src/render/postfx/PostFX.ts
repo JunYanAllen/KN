@@ -44,6 +44,13 @@ export interface PostFXParams {
   depthEdge: number;
   /** Weight of the normal-crease term — the one that finds real creases. */
   normalEdge: number;
+  /**
+   * Weight of the depth-curvature (roof-edge) term. Hull panels are lofted
+   * patches with smoothed normals, so a chine inside a patch has no normal
+   * discontinuity for `normalEdge` to find — only a jump in depth *slope*.
+   * This is the term that inks it.
+   */
+  creaseEdge: number;
   /** Bloom intensity. */
   bloom: number;
   /** Final exposure, applied before the grade. */
@@ -64,11 +71,12 @@ export class PostFX {
   readonly outputPass: OutputPass;
 
   readonly params: PostFXParams = {
-    edgeStrength: 0.85,
-    edgeThreshold: 0.34,
-    depthEdge: 0.55,
+    edgeStrength: 0.95,
+    edgeThreshold: 0.2,
+    depthEdge: 0.5,
     normalEdge: 1.0,
-    bloom: 0.55,
+    creaseEdge: 0.9,
+    bloom: 0.85,
     exposure: 1.0,
     silhouetteReject: 0.05,
   };
@@ -128,6 +136,18 @@ export class PostFX {
     this.composer.addPass(this.bloomPass);
     this.composer.addPass(this.outputPass);
 
+    // ---- diagnostics ------------------------------------------------------
+    // `?postfx=sobel` replaces the frame with a 2x2 mosaic of the prepass
+    // normal buffer, linear depth, the raw edge responses and the finished
+    // line; `?postfx=bloom` replaces it with a banded map of pre-bloom
+    // luminance. Both exist so the two passes can be tuned against a captured
+    // frame rather than against arithmetic. Off unless explicitly asked for.
+    if (typeof window !== 'undefined' && window.location) {
+      const mode = new URLSearchParams(window.location.search).get('postfx');
+      if (mode === 'sobel') this.sobelPass.uniforms.uDebug.value = 1;
+      if (mode === 'bloom') this.bloomPass.debug = 1;
+    }
+
     // Adaptive resolution changes the renderer's pixel ratio without anyone
     // calling PostFX.setSize(), which would leave the composer rendering at the
     // old internal size and blitting a mis-scaled frame. Hook the engine's
@@ -161,6 +181,7 @@ export class PostFX {
     su.uEdgeThreshold.value = p.edgeThreshold;
     su.uDepthEdge.value = p.depthEdge;
     su.uNormalEdge.value = p.normalEdge;
+    su.uCreaseEdge.value = p.creaseEdge;
     su.uSilhouette.value = p.silhouetteReject;
     this.sobelPass.sync(this._engine.camera);
 

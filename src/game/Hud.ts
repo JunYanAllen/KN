@@ -62,9 +62,14 @@ const FONT_STACK =
   'ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Display", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 
 const INK = PAL.uiInk;
-const PAPER = 'rgba(244,254,255,0.94)';
+/**
+ * Plates are OPAQUE. They used to be 94% paper, and at that value a white gate
+ * post behind the splits panel read straight through the LAST and BEST rows.
+ * A drawn plate is a piece of card; card is not a filter.
+ */
+const PAPER = PAL.uiPaper;
 const PAPER_SOLID = PAL.uiPaper;
-const INK_FIELD = 'rgba(10,22,34,0.86)';
+const INK_FIELD = '#0a1622';
 const INK_TRACK = 'rgba(10,22,34,0.34)';
 /**
  * Unlit instrument segments. Opaque on purpose: a translucent unlit segment
@@ -75,7 +80,11 @@ const TRACK_SLATE = '#20364d';
 const ACCENT = PAL.uiAccent;
 const WARN = PAL.uiWarn;
 const HOT = PAL.uiHot;
+/** Reserved for data that is neither a warning nor a go signal. Deliberately
+ *  unused on the instruments: it is the same hue as `waterShallow`, so anything
+ *  drawn in it disappears into the sea the HUD is drawn over. */
 const COOL = PAL.uiCool;
+void COOL;
 
 const ORDINALS = ['—', '1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'];
 
@@ -95,6 +104,25 @@ function clamp01(v: number): number {
 function jit(seed: number, i: number): number {
   const s = Math.sin(seed * 12.9898 + i * 78.233) * 43758.5453;
   return (s - Math.floor(s)) * 2 - 1;
+}
+
+/**
+ * The round sibling of `platePath`: a jittered n-gon centred on the origin. The
+ * speedometer needs a backing plate and a chamfered rectangle behind a circular
+ * gauge reads as a mounting bracket; a hand-cut disc reads as the instrument.
+ */
+function discPlatePath(r: number, seed: number, sides: number, j: number): Path2D {
+  const p = new Path2D();
+  for (let i = 0; i < sides; i++) {
+    const a = (i / sides) * Math.PI * 2 - Math.PI / 2;
+    const rr = r + jit(seed, i) * j;
+    const x = Math.cos(a) * rr;
+    const y = Math.sin(a) * rr;
+    if (i === 0) p.moveTo(x, y);
+    else p.lineTo(x, y);
+  }
+  p.closePath();
+  return p;
 }
 
 /**
@@ -193,6 +221,8 @@ export class Hud {
   private pMapField!: Path2D;
   private pBoost!: Path2D;
   private pResults!: Path2D;
+  private pSpeedo!: Path2D;
+  private pSpdSlab!: Path2D;
 
   private lapX = 0;
   private lapY = 0;
@@ -217,6 +247,9 @@ export class Hud {
   private spdCY = 0;
   private spdR = 0;
   private spdTh = 0;
+  private spdPlateR = 0;
+  private spdSlabW = 0;
+  private spdSlabH = 0;
   private resX = 0;
   private resY = 0;
   private resW = 0;
@@ -354,17 +387,26 @@ export class Hud {
     this.pMapField = platePath(this.mapFieldW, this.mapFieldH, 21.9, ch * 0.6, j * 0.6);
 
     // ---- bottom left: boost ----------------------------------------------
-    this.boostW = Math.min(404 * S, w * 0.36);
-    this.boostH = 48 * S;
+    // Taller than it was: the old 48-unit strip had no room for a label row, a
+    // segmented meter and a tier scale, so it collapsed into an unstyled bar.
+    this.boostW = Math.min(400 * S, w * 0.36);
+    this.boostH = 92 * S;
     this.boostX = M;
     this.boostY = h - M - this.boostH;
-    this.pBoost = platePath(this.boostW, this.boostH, 27.4, ch * 0.6, j);
+    this.pBoost = platePath(this.boostW, this.boostH, 27.4, ch * 0.8, j);
 
     // ---- bottom right: speedometer ---------------------------------------
-    this.spdR = 116 * S;
-    this.spdTh = 25 * S;
-    this.spdCX = w - M - this.spdR - this.spdTh * 0.5;
-    this.spdCY = h - M - this.spdR - this.spdTh * 0.5;
+    this.spdR = 112 * S;
+    this.spdTh = 24 * S;
+    // The gauge gets the same paper backing every other element has, so the
+    // numerals never have to survive directly against the sea.
+    this.spdPlateR = this.spdR + this.spdTh * 0.5 + 17 * S;
+    this.spdCX = w - M - this.spdPlateR;
+    this.spdCY = h - M - this.spdPlateR;
+    this.pSpeedo = discPlatePath(this.spdPlateR, 52.7, 15, 2.4 * S);
+    this.spdSlabW = 152 * S;
+    this.spdSlabH = 84 * S;
+    this.pSpdSlab = platePath(this.spdSlabW, this.spdSlabH, 61.3, 13 * S, 1.5 * S);
 
     // ---- results ----------------------------------------------------------
     this.resW = Math.min(780 * S, w - 72 * S);
@@ -634,59 +676,115 @@ export class Hud {
   //  BOOST
   // -------------------------------------------------------------------------
 
+  /**
+   * Boost meter, drawn in the same language as the LAP and TIME plates and the
+   * speedometer: paper plate, ink stroke, a label with a size hierarchy, and an
+   * ink underlay whose gaps become the separators between the lit segments.
+   *
+   * Three tiers of four. The drift charge pays out in tiers, so the meter shows
+   * tiers — a 12-cell strip with no grouping cannot tell you whether letting go
+   * now buys you anything.
+   */
   private drawBoost(s: HudState) {
     const g = this.g;
     const S = this.S;
-    const SEGS = 12;
+    const TIERS = 3;
+    const PER = 4;
 
-    this.openPlate(this.pBoost, this.boostX, this.boostY, -0.008, PAPER, 3.2 * S);
+    this.openPlate(this.pBoost, this.boostX, this.boostY, -0.008, PAPER, 3.4 * S);
 
-    g.font = this.fMapLabel;
-    this.text('BOOST', 14 * S, 18 * S, 'left', 2.0 * S, INK);
-
-    // While boosting the bar shows what is left to spend; otherwise it shows
-    // what has been banked in the slide. One bar, two meanings, no ambiguity
-    // because the colour changes with it.
+    // While boosting the meter shows what is left to spend; otherwise it shows
+    // what has been banked in the slide. One meter, two meanings, no ambiguity
+    // because the chip and the colour change with it.
     const boosting = s.boost > 0.01;
     const value = clamp01(boosting ? s.boost : s.driftCharge);
     const full = !boosting && s.driftCharge > 0.985;
-    const flash = full && Math.sin(this.clock * 17) > -0.1;
+    const flash = (full || boosting) && Math.sin(this.clock * 17) > -0.1;
+    const tierCols = [ACCENT, WARN, HOT];
 
-    const x0 = 14 * S;
-    const y0 = 23 * S;
-    const bw = this.boostW - 28 * S;
-    const bh = this.boostH - y0 - 10 * S;
-    const gap = 3.5 * S;
-    const sw = (bw - gap * (SEGS - 1)) / SEGS;
-    const skew = 5 * S; // the whole meter leans, like a drawn tally
+    // ---- label row --------------------------------------------------------
+    g.font = this.fLabel;
+    this.text('BOOST', 17 * S, 30 * S, 'left', 2.4 * S, INK);
 
-    const litCount = Math.round(value * SEGS);
-    for (let i = 0; i < SEGS; i++) {
-      const x = x0 + i * (sw + gap);
-      const lit = i < litCount;
-      let col: string;
-      if (!lit) col = INK_TRACK;
-      else if (boosting) col = HOT;
-      else if (flash) col = PAPER_SOLID;
-      else col = i >= SEGS - 3 ? WARN : ACCENT;
-      this.bar(x, y0, sw, bh, col, skew);
-    }
-
-    // Ink the tally as one outline rather than 12, so it reads as a meter.
+    // State chip: a stamped slab, not a word floating on the plate.
+    const chip = boosting ? 'FIRING' : full ? 'READY' : 'CHARGE';
+    const chipFill = boosting ? HOT : full ? (flash ? HOT : WARN) : TRACK_SLATE;
+    const cw = 104 * S;
+    const chh = 27 * S;
+    const cx = this.boostW - 17 * S - cw;
+    const cy = 8 * S;
     g.beginPath();
-    g.moveTo(x0 + skew - 2 * S, y0 - 2 * S);
-    g.lineTo(x0 + bw + skew + 2 * S, y0 - 2 * S);
-    g.lineTo(x0 + bw + 2 * S, y0 + bh + 2 * S);
-    g.lineTo(x0 - 2 * S, y0 + bh + 2 * S);
+    g.moveTo(cx + 5 * S, cy);
+    g.lineTo(cx + cw, cy + 1 * S);
+    g.lineTo(cx + cw - 5 * S, cy + chh);
+    g.lineTo(cx, cy + chh - 1 * S);
     g.closePath();
+    g.fillStyle = chipFill;
+    g.fill();
     g.lineWidth = 3.0 * S;
     g.strokeStyle = INK;
     g.lineJoin = 'miter';
     g.stroke();
+    g.font = this.fMapLabel;
+    this.text(chip, cx + cw * 0.5, cy + chh * 0.66, 'center', 2.0 * S, PAPER_SOLID);
 
-    if (full) {
-      g.font = this.fMapLabel;
-      this.text('READY', this.boostW - 14 * S, 18 * S, 'right', 2.0 * S, flash ? HOT : INK);
+    // ---- meter ------------------------------------------------------------
+    const x0 = 17 * S;
+    const y0 = 40 * S;
+    const bw = this.boostW - 34 * S;
+    const bh = 27 * S;
+    const tGap = 11 * S;
+    const sGap = 3.4 * S;
+    const ink = 3.2 * S;
+    const tierW = (bw - tGap * (TIERS - 1)) / TIERS;
+    const segW = (tierW - sGap * (PER - 1) - ink * 2) / PER;
+    const lit = Math.round(value * TIERS * PER);
+
+    // Shear the whole meter rather than shearing each cell: a per-cell skew
+    // gives the inner segments a different lean from the ink block they sit in
+    // and the border stops being uniform.
+    const sk = 0.17;
+    g.save();
+    g.transform(1, 0, -sk, 1, sk * (y0 + bh), 0);
+
+    for (let t = 0; t < TIERS; t++) {
+      const tx = x0 + t * (tierW + tGap);
+      this.bar(tx, y0, tierW, bh, INK);
+      for (let k = 0; k < PER; k++) {
+        const idx = t * PER + k;
+        const on = idx < lit;
+        const col = !on
+          ? TRACK_SLATE
+          : boosting
+            ? flash
+              ? PAPER_SOLID
+              : HOT
+            : flash
+              ? PAPER_SOLID
+              : tierCols[t];
+        this.bar(tx + ink + k * (segW + sGap), y0 + ink, segW, bh - ink * 2, col);
+      }
+    }
+    g.restore();
+
+    // ---- tier scale -------------------------------------------------------
+    // The one piece of information the old bar could not give: how much of a
+    // payoff is already banked.
+    g.font = this.fMapLabel;
+    for (let t = 0; t < TIERS; t++) {
+      const tx = x0 + t * (tierW + tGap);
+      const done = value >= (t + 1) / TIERS - 1e-3;
+      const label = t === 0 ? 'I' : t === 1 ? 'II' : 'III';
+      this.text(
+        label,
+        tx + tierW * 0.5,
+        this.boostH - 13 * S,
+        'center',
+        2.2 * S,
+        done ? tierCols[t] : INK_TRACK,
+        done ? 3.4 * S : 0,
+        INK
+      );
     }
 
     this.closePlate();
@@ -712,6 +810,22 @@ export class Hud {
     const SEGS = 26;
 
     const frac = clamp01(s.speed / Math.max(1, s.maxSpeed));
+
+    // 0. BACKING PLATE. Every other element in this HUD is drawn on paper; the
+    //    gauge used to be the one thing floating straight on the sea, which
+    //    meant its dark ring was the highest-contrast object in the frame while
+    //    its numerals had nothing but their own stroke holding them up. A
+    //    hand-cut paper disc fixes both at once.
+    g.save();
+    g.translate(cx, cy);
+    g.rotate(-0.011);
+    g.fillStyle = PAPER;
+    g.fill(this.pSpeedo);
+    g.lineWidth = 3.4 * S;
+    g.strokeStyle = INK;
+    g.lineJoin = 'miter';
+    g.stroke(this.pSpeedo);
+    g.restore();
 
     // 1. One fat ink arc underneath. Everything after this sits inside it, so
     //    the gaps between segments become ink separators for free.
@@ -756,13 +870,39 @@ export class Hud {
       g.lineCap = 'butt';
     }
 
-    // 5. Numerals. m/s is the sim unit but a three-digit km/h number is what a
-    //    speedo is for — the size of the number is doing the work here.
+    // 5. READOUT. An ink slab inside the ring with paper numerals on it, and the
+    //    unit label in ink on the paper plate below. Two reversals of the same
+    //    two colours, so the number survives over the brightest foam (it is
+    //    paper on ink) and the label survives over the darkest trough (it is ink
+    //    on paper). Neither depends on what is behind the HUD.
+    g.save();
+    g.translate(cx - this.spdSlabW * 0.5, cy - this.spdSlabH * 0.5 + 4 * S);
+    g.rotate(-0.011);
+    g.fillStyle = INK_FIELD;
+    g.fill(this.pSpdSlab);
+    g.lineWidth = 3.0 * S;
+    g.strokeStyle = INK;
+    g.lineJoin = 'miter';
+    g.stroke(this.pSpdSlab);
+    // A thin racer-coloured rule along the bottom of the slab, keyed the same
+    // way the LAP plate is.
+    const idx = s.player.index % this.racerHex.length;
+    this.bar(12 * S, this.spdSlabH - 9 * S, 34 * S, 4 * S, this.racerHex[idx]);
+
     const kph = Math.round(s.speed * 3.6);
     g.font = this.fSpeed;
-    this.text(this.mSpeed.get(kph, fmtInt), cx, cy + 16 * S, 'center', -3.5 * S, PAPER_SOLID, 8 * S, INK);
+    this.text(
+      this.mSpeed.get(kph, fmtInt),
+      this.spdSlabW * 0.5,
+      this.spdSlabH * 0.72,
+      'center',
+      -3.5 * S,
+      PAPER_SOLID
+    );
+    g.restore();
+
     g.font = this.fSpeedUnit;
-    this.text('KM/H', cx, cy + 42 * S, 'center', 3.0 * S, PAPER_SOLID, 4.2 * S, INK);
+    this.text('KM/H', cx, cy + this.spdSlabH * 0.5 + 26 * S, 'center', 3.0 * S, INK);
 
     // 6. A drawn tick at the redline so the gauge has a scale, not just a fill.
     const aR = A0 + SWEEP * 0.87;

@@ -55,7 +55,13 @@ void main() {
   // HARD mask. A smoothstep here is the single change that would turn this back
   // into photographic bloom: everything in the shoulder starts contributing a
   // low-amplitude haze that spreads over the whole frame.
-  gl_FragColor = vec4(c * step(uThreshold, l), 1.0);
+  //
+  // Only the EXCESS over the threshold is passed on, not the whole colour. With
+  // the full colour, a pixel one part in a thousand over the line dumps its
+  // entire 2.2 of energy into the blur, so the halo's size is decided by the
+  // *area* of the hot region rather than by how hot it is — which is how a
+  // one-pixel specular chip ends up with the same halo as the sun.
+  gl_FragColor = vec4(max(c - uThreshold, 0.0) * step(uThreshold, l), 1.0);
 }
 `;
 
@@ -99,6 +105,7 @@ uniform float uSteps;    // how many steps before the halo saturates
 uniform float uExposure;
 uniform float uSaturation;
 uniform float uContrast;
+uniform float uDebug;    // 0 = off; 1 = luminance heat map (threshold picking)
 
 varying vec2 vUv;
 
@@ -107,20 +114,44 @@ const vec3 LUM = vec3(0.2126, 0.7152, 0.0722);
 void main() {
   vec3 base = texture2D(tDiffuse, vUv).rgb;
 
-  // Weight the coarser mips up: they carry the wide, low-amplitude part of the
-  // halo, and without the lift the glow collapses to a tight ring.
-  vec3 g = texture2D(tB1, vUv).rgb * 0.55
-         + texture2D(tB2, vUv).rgb * 0.85
-         + texture2D(tB3, vUv).rgb * 1.00;
+  // ---- diagnostic ----------------------------------------------------------
+  // Only ever reached with ?postfx=bloom in the URL. Bands the pre-bloom linear
+  // luminance so a threshold can be picked against a real frame instead of
+  // against arithmetic: grey below 1.0, then blue / green / yellow / red for
+  // 1.0-1.5, 1.5-2.0, 2.0-2.6 and above.
+  if (uDebug > 0.5) {
+    float lb = dot(base, LUM);
+    vec3 o = vec3(lb * 0.30);
+    if (lb >= 1.0) o = vec3(0.10, 0.25, 1.00);
+    if (lb >= 1.5) o = vec3(0.10, 0.90, 0.25);
+    if (lb >= 2.0) o = vec3(1.00, 0.90, 0.10);
+    if (lb >= 2.6) o = vec3(1.00, 0.10, 0.10);
+    gl_FragColor = vec4(o, 1.0);
+    return;
+  }
+
+  // The half-resolution tier carries the halo; the coarser two only widen it.
+  // Weighting them *down* (the opposite of a photographic bloom, which leans on
+  // the wide mips for its haze) is what keeps the glow a tight graphic ring
+  // around the hot shape instead of a mist over the frame.
+  vec3 g = texture2D(tB1, vUv).rgb * 1.00
+         + texture2D(tB2, vUv).rgb * 0.70
+         + texture2D(tB3, vUv).rgb * 0.35;
 
   // ---- QUANTISED HALO ------------------------------------------------------
   // Snap the glow's *magnitude* to a few flat levels and keep its hue. Because
   // the underlying blur is monotonic outward, equal-magnitude levels come out
-  // as concentric bands with hard edges: three or four drawn haloes instead of
-  // one continuous falloff. ceil() (not round) means the outermost band ends on
-  // a hard edge rather than fading to nothing.
+  // as concentric bands with hard edges: two or three drawn haloes instead of
+  // one continuous falloff.
+  //
+  // floor(), not ceil(). ceil() promotes every non-zero tail pixel to a full
+  // step, so the entire reach of the blur — dozens of pixels of near-nothing —
+  // gets lifted by one flat amount, and THAT is the pale smudge that was
+  // haloing the riders. floor() throws the tail away outright: the outermost
+  // band ends where the blur genuinely still has a step's worth of energy, and
+  // the halo has a hard, drawable boundary close to the source.
   float m = max(max(g.r, g.g), g.b);
-  float q = ceil(clamp(m / uStep, 0.0, uSteps)) * uStep;
+  float q = floor(clamp(m / uStep, 0.0, uSteps)) * uStep;
   vec3 glow = g * (q / max(m, 1e-4));
 
   vec3 col = base + glow * uIntensity;
@@ -186,17 +217,33 @@ export class BloomPass extends Pass {
     this.needsSwap = true;
 
     const {
-      // Linear-light luminance, and deliberately ABOVE 1.0. The cel ramp's hot
-      // band multiplies by 1.08, so an ordinary sunlit white surface — foam,
-      // most of the ocean's crest band — already lands around 1.05. Threshold
-      // at paper white and the whole sea starts glowing and the frame hazes,
-      // which is exactly the photographic look this pass exists to avoid. 1.15
-      // lets through only what is genuinely emissive or additive: the sun card
-      // (2.6), the boost flames, the green racing line's glow cards.
-      threshold = 1.15,
-      intensity = 0.55,
-      steps = 4,
-      stepSize = 0.16,
+      // Linear-light luminance, and deliberately WELL above 1.0.
+      //
+      // 1.15 was far too low and it is what put pale haloes on the riders'
+      // helmets. The cel shader stacks a banded specular (up to 1.45 *
+      // specStrength, and the boat cowlings run specStrength 1.1) and a fresnel
+      // rim (uRim 0.6 of PAL.skyHorizon) on top of a fully lit base. A white
+      // surface catching both lands near 1.7-2.4 in linear light, and the rim
+      // term does it *exactly on the silhouette* — so every high-contrast edge
+      // in the frame was seeding a halo. That is a photographic artefact and
+      // the art direction forbids it.
+      //
+      // 1.6 was measured, not guessed. The `?postfx=bloom` heat map over a
+      // captured countdown frame puts the hottest shaded pixel in the picture —
+      // the specular chip on the start gate's post — at luminance 1.4, and the
+      // whole of the chase frame under 0.55. So 1.6 clears every surface the
+      // cel material can produce with room to spare, while leaving a full stop
+      // of headroom under the only things that genuinely emit: the sun card
+      // (uCore * 2.6 additive over the sky, so ~3.0), the boost flame and the
+      // additive glow cards on the racing line. Going higher would mean the
+      // pass never fires at all.
+      threshold = 1.6,
+      intensity = 0.85,
+      // Two visible steps plus the hard cutoff, not four. See the floor() note
+      // in the composite: a step is a drawn band, and three of them at this
+      // size is already the outer limit of what still reads as flat.
+      steps = 3,
+      stepSize = 0.34,
       exposure = 1.0,
       saturation = 1.16,
       contrast = 1.07,
@@ -242,6 +289,7 @@ export class BloomPass extends Pass {
         uExposure: { value: exposure },
         uSaturation: { value: saturation },
         uContrast: { value: contrast },
+        uDebug: { value: 0 },
       },
       vertexShader: FS_VERT,
       fragmentShader: COMPOSITE_FRAG,
@@ -288,6 +336,14 @@ export class BloomPass extends Pass {
   }
   set contrast(v: number) {
     this._composite.uniforms.uContrast.value = v;
+  }
+
+  /** Diagnostic only: 1 replaces the frame with a pre-bloom luminance heat map. */
+  get debug(): number {
+    return this._composite.uniforms.uDebug.value as number;
+  }
+  set debug(v: number) {
+    this._composite.uniforms.uDebug.value = v;
   }
 
   // --------------------------------------------------------------------------

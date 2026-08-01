@@ -29,31 +29,50 @@ import {
  * ============================================================================
  *
  *  Nothing here is a scaled primitive standing in for a shape. The hull is a
- *  real loft: fifteen stations of a parametric cross-section, swept from a flat
- *  planing transom through a deep-V midbody to a knife bow with 0.55 m of rake.
+ *  real loft: twenty-nine stations of a parametric cross-section, swept from a
+ *  flat planing transom through a deep-V midbody to a knife bow with 0.70 m of
+ *  rake.
  *
- *  THE ONE STRUCTURAL IDEA IN THIS FILE — NORMAL ISLANDS
- *  -----------------------------------------------------
+ *  IDEA 1 — NORMAL ISLANDS
+ *  -----------------------
  *  A cel ramp only looks like a cel ramp if the terminator has somewhere hard
  *  to land. On a fully smoothed hull it wanders; on a fully faceted hull the
- *  whole boat turns into noise. So the hull is built as a set of *patches*
- *  (bottom-L, bottom-R, topside-L, topside-R, deck, transom, stem). Each patch
- *  gets `computeVertexNormals()` run on it **while it is still indexed and
- *  still alone**, so it is smooth internally, and is then flattened to a
- *  triangle soup before merging. Because the merge never welds, the vertices
- *  along a shared edge keep two different normals:
+ *  whole boat turns into noise. So the hull is built as a set of *patches*.
+ *  Each patch gets `computeVertexNormals()` run on it **while it is still
+ *  indexed and still alone**, so it is smooth internally, and is then flattened
+ *  to a triangle soup before merging. Because the merge never welds, the
+ *  vertices along a shared edge keep two different normals:
  *
- *      keel   = bottom-L | bottom-R   -> hard crease
- *      chine  = bottom   | topside    -> hard crease   <-- the important one
- *      sheer  = topside  | deck       -> hard crease
+ *      keel     = bottom-L | bottom-R    -> hard crease
+ *      chine    = bottom   | spray rail  -> hard crease
+ *      rail top = rail     | topside     -> hard crease   <-- the waterline
+ *      knuckle  = inside the topside patch, a lateral kink
+ *      sheer    = topside  | deck        -> hard crease
+ *      centre   = deck-L   | deck-R      -> hard crease
  *
- *  Those three creases are what the ramp snaps to and what the Sobel prepass
- *  finds as interior line work. Getting them for free out of the patch layout
- *  is much more robust than trying to angle-threshold them after the fact.
+ *  Those creases are what the ramp snaps to and what the Sobel prepass finds as
+ *  interior line work. The spray rail is the important addition: it turns the
+ *  single chine into a *pair* of parallel lines with a downward-facing lip
+ *  between them, so the hull always carries a hard dark band at its widest
+ *  point no matter where the sun is.
+ *
+ *  IDEA 2 — LIVERY SLOTS, NOT A COLOUR BLEND
+ *  -----------------------------------------
+ *  `aTint` is normally a 0..1 blend between `uColor` and `uColor2`. Here it is
+ *  re-read as a FOUR SLOT INDEX (paper / racer light / racer dark / ink) and
+ *  rounded in the *fragment* stage. Rounding an interpolated attribute is what
+ *  makes the boundary a hard edge instead of an airbrush: wherever two ends of
+ *  a triangle disagree, the colour flips at one exact contour line.
+ *
+ *  `edgeSlot()` then packs a signed parameter-space field into the gap between
+ *  two adjacent slots, so that contour reproduces the field's zero line
+ *  exactly. That is how the racing stripe gets a clean diagonal break instead
+ *  of a staircase at station resolution.
  *
  *  Local frame: bow at +Z, +Y up, origin at the waterline on the centreline.
  *  Length 4.60 m, beam 1.50 m, so this matches the buoyancy sample points in
- *  Boat.ts one-for-one — the two files are tuned against the same numbers.
+ *  Boat.ts one-for-one — the two files are tuned against the same numbers, and
+ *  the six sample depths in Boat.ts were re-checked against this loft.
  */
 
 export interface BoatParts {
@@ -259,6 +278,31 @@ function paintConst(g: BufferGeometry, tint: number, ao: number): BufferGeometry
   return g;
 }
 
+/**
+ * Paint tint/AO from the patch's own (u, v) parameterisation. `gridPatch` stores
+ * it in `uv`, so livery can be authored in the space the surface was drawn in
+ * rather than reverse-engineered from world position.
+ */
+function paintUV(
+  g: BufferGeometry,
+  tintFn: (u: number, v: number) => number,
+  aoFn?: (u: number, v: number) => number
+): BufferGeometry {
+  const uv = g.getAttribute('uv') as BufferAttribute;
+  const n = uv.count;
+  const t = new Float32Array(n);
+  const a = new Float32Array(n).fill(1);
+  for (let k = 0; k < n; k++) {
+    const u = uv.getX(k);
+    const v = uv.getY(k);
+    t[k] = tintFn(u, v);
+    if (aoFn) a[k] = aoFn(u, v);
+  }
+  g.setAttribute('aTint', new BufferAttribute(t, 1));
+  g.setAttribute('aAO', new BufferAttribute(a, 1));
+  return g;
+}
+
 /** Translate/rotate a patch into place before merging. */
 function place(g: BufferGeometry, x: number, y: number, z: number, rx = 0, ry = 0, rz = 0) {
   _euler.set(rx, ry, rz, 'XYZ');
@@ -272,143 +316,300 @@ const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
 // ---------------------------------------------------------------------------
+//  Livery slots
+// ---------------------------------------------------------------------------
+
+/**
+ * Four flat colours, indexed by `aTint` and rounded in the fragment stage.
+ * Regions that touch MUST use adjacent slots: interpolation between 0 and 1
+ * passes through 1/3 and 2/3 and would print a pinstripe of the wrong colour
+ * across the boundary.
+ */
+const S_PAPER = 0 / 3; // graphic white — stripes, boot-top, crown flash
+const S_LIGHT = 1 / 3; // PAL.racer[i]      — main body
+const S_DARK = 2 / 3; // PAL.racerDark[i]  — lower hull, gunwale, cowl flanks
+const S_INK = 3 / 3; // near-black        — recesses, intake mouths
+
+/**
+ * Pack a signed parameter-space field into the gap between two adjacent slots.
+ * The shader thresholds at the midpoint, so the interpolated attribute
+ * reproduces the field's zero contour *exactly* — a clean diagonal instead of a
+ * staircase at vertex resolution.
+ *
+ * `w` must be at least one vertex spacing in the field's units, otherwise both
+ * ends of an edge saturate and the contour between them is lost.
+ */
+function edgeSlot(field: number, negSlot: number, posSlot: number, w: number): number {
+  return lerp(negSlot, posSlot, clamp01(0.5 + field / (2 * w)));
+}
+
+/**
+ * Injected into `celMaterial`'s fragment stage. `base`, `rampTint` and `upQ` are
+ * all still in scope at the injection point, so the albedo-dependent terms can
+ * be re-run with the livery colour while the specular and rim — which do NOT
+ * depend on albedo — are left exactly as the shared shader computed them.
+ *
+ * The one approximation: on a surface with a matcap the diffuse term has already
+ * been scaled by (1 - 0.45 * matcapStrength). We keep matcapStrength low
+ * (<= 0.16) on liveried meshes so that error stays under a couple of percent.
+ */
+const LIVERY_FRAG = /* glsl */ `
+  // vTint is a SLOT INDEX, not a blend. Rounding it here is what turns an
+  // interpolated vertex attribute into a hard-edged graphic.
+  float slot = floor(clamp(vTint, 0.0, 1.0) * 3.0 + 0.5);
+  vec3 liv = slot < 0.5 ? uLivPaper
+           : slot < 1.5 ? uLivLight
+           : slot < 2.5 ? uLivDark
+                        : uLivInk;
+  celColor += (liv - base) * (rampTint * uSunColor + mix(uGroundColor, uSkyColor, upQ) * 0.16);
+`;
+
+/**
+ * `celMaterial` has no injection point for fragment-stage *declarations*, only
+ * for statements inside main(). Rather than fork the shared shader, the four
+ * livery uniforms are spliced in immediately after its precision statement.
+ */
+function declareLivery(mat: ShaderMaterial): ShaderMaterial {
+  const anchor = 'precision highp float;';
+  mat.fragmentShader = mat.fragmentShader.replace(
+    anchor,
+    anchor +
+      `
+uniform vec3 uLivPaper;
+uniform vec3 uLivLight;
+uniform vec3 uLivDark;
+uniform vec3 uLivInk;`
+  );
+  return mat;
+}
+
+const LIVERY_PAPER = new Color(0xf4feff);
+const LIVERY_INK = new Color(0x0d1a29);
+
+function liveryUniforms(light: Color, dark: Color) {
+  return {
+    uLivPaper: { value: LIVERY_PAPER.clone() },
+    uLivLight: { value: light.clone() },
+    uLivDark: { value: dark.clone() },
+    uLivInk: { value: LIVERY_INK.clone() },
+  };
+}
+
+// ---------------------------------------------------------------------------
 //  Hull lines
 // ---------------------------------------------------------------------------
 
 const HULL_LEN = 4.6;
 const HULL_HALF_LEN = HULL_LEN / 2; // stern z = -2.30, deck bow z = +2.30
-const STATIONS = 15;
+const STATIONS = 29;
+
+/** Panel ids. v always runs from the lower/outboard edge to the upper/inboard one. */
+const P_BOT = 0; // keel      -> chine
+const P_RAIL = 1; // chine     -> rail top   (the spray rail lip)
+const P_TOP = 2; // rail top  -> sheer
+const P_DECK = 3; // sheer     -> centreline (one half, per side)
+
+const BOT_ROWS = 10;
+const RAIL_ROWS = 3;
+const TOP_ROWS = 15;
+const DECK_ROWS = 7;
 
 /** Station longitudinal position. u = 0 at the transom, 1 at the stem head. */
 const stationZ = (u: number) => -HULL_HALF_LEN + HULL_LEN * u;
 
 /**
- * Half-beam at the chine. Max beam 0.75 (1.50 m overall) sits at u = 0.45, just
- * aft of centre — that is where a planing hull carries its width. The bow term
- * takes 97% of it away by the stem, leaving a 45 mm sliver rather than a true
- * singularity, because a degenerate ring makes normals fall over.
+ * Half-beam at the spray rail — the widest point of the section. Max 0.75
+ * (1.50 m overall) at u = 0.45, just aft of centre, which is where a planing
+ * hull carries its width. The 1.9 exponent holds the beam full further aft than
+ * a quadratic would and then collapses it hard: full shoulders, fine entry.
  */
 function beamAt(u: number): number {
   const fore = Math.max(0, (u - 0.45) / 0.55);
   const aft = Math.max(0, (0.45 - u) / 0.45);
-  return 0.75 * (1 - Math.pow(fore, 1.6) * 0.97) * (1 - aft * aft * 0.1);
+  return 0.75 * (1 - Math.pow(fore, 1.9) * 0.975) * (1 - aft * aft * 0.12);
 }
+
+/** Outboard step of the spray rail. Tapers forward and can never eat the beam. */
+const RAIL_H = 0.055;
+const railWidth = (u: number) => Math.min(0.055 * (1 - 0.5 * u), beamAt(u) * 0.35);
+const chineHalf = (u: number) => beamAt(u) - railWidth(u);
 
 /** Deadrise, expressed as the vertical drop from chine to keel. Deep forward
  *  (cuts chop), nearly flat at the transom (planes and releases cleanly). */
-const deadriseAt = (u: number) => 0.045 + 0.3 * Math.pow(u, 1.25);
+const deadriseAt = (u: number) => 0.05 + 0.36 * Math.pow(u, 1.3);
 
 /** The chine line itself: buried aft, sweeping hard up out of the water forward. */
 function chineYAt(u: number): number {
-  const rise = Math.max(0, (u - 0.55) / 0.45);
-  return -0.17 - 0.05 * Math.sin(Math.PI * Math.min(1, u / 0.7)) + 0.52 * rise * rise;
+  const rise = Math.max(0, (u - 0.5) / 0.5);
+  return -0.175 - 0.05 * Math.sin(Math.PI * Math.min(1, u / 0.7)) + 0.5 * rise * rise;
 }
 
-/** Sheer (gunwale) line — rises toward the bow so the boat reads as forward-leaning. */
-const sheerYAt = (u: number) => 0.24 + 0.3 * Math.pow(u, 1.8) + 0.03 * Math.sin(u * Math.PI);
+/** Sheer (gunwale) line. Rises 0.47 m to the bow — the single biggest reason the
+ *  profile reads forward-leaning rather than like a slipper. */
+const sheerYAt = (u: number) => 0.22 + 0.47 * u * u + 0.03 * Math.sin(u * Math.PI);
 
-/** Stem rake: how far aft the lower points are dragged. 0.55 m at the forefoot. */
+/**
+ * Stem rake: how far aft the lower points are dragged. 0.70 m at the forefoot,
+ * up from 0.55, and starting at u = 0.48 instead of 0.60 so the whole forward
+ * third leans. Pushed no further because Boat.ts samples buoyancy at z = 1.45
+ * assuming that is where the forefoot skin is; at 0.70 m of rake the keel is at
+ * z = 1.60 and the sample lands 5 cm off, which is the same error the old lines
+ * had. At 0.98 m it would be 23 cm off and the bow would fly.
+ */
 function rakeAt(u: number): number {
-  const r = Math.max(0, (u - 0.6) / 0.4);
-  return 0.55 * r * r;
+  const r = Math.max(0, (u - 0.48) / 0.52);
+  return 0.7 * Math.pow(r, 1.9);
 }
 
-/** Half-beam at the sheer. Slight tumblehome (topsides lean in) except at the bow. */
-const deckHalfAt = (u: number) => beamAt(u) * 0.95 + 0.02;
+/** Half-beam at the sheer. Tumblehome: the topsides lean in above the knuckle. */
+const deckHalfAt = (u: number) => beamAt(u) * 0.93 + 0.02;
+
+/**
+ * Bottom-panel profile. Each row is (lateral fraction keel->chine, height lift).
+ * The two pairs of rows that share a lateral fraction are the SPRAY STRAKES —
+ * near-vertical steps that break the planing surface into three bands. Without
+ * them the bottom is one flat quad that takes the ramp as a single value and
+ * reads as untextured cardboard from the chase camera.
+ *
+ * The lift returns to zero at the chine so the panel's outboard edge still
+ * coincides exactly with the spray rail's inboard edge — the ink shell welds
+ * across that seam and a mismatch would tear it open.
+ */
+const BOTTOM_S = [0.0, 0.15, 0.32, 0.32, 0.5, 0.64, 0.64, 0.82, 0.93, 1.0];
+const BOTTOM_DY = [0.0, 0.0, 0.0, 0.017, 0.017, 0.017, 0.034, 0.034, 0.017, 0.0];
+
+/** Lateral position of the topside knuckle, snapped to a real vertex row. */
+const KNUCKLE_V = 4 / (TOP_ROWS - 1);
 
 /**
  * One point on the hull skin.
- *   panel 0 = bottom  (v: keel -> chine)
- *   panel 1 = topside (v: chine -> sheer)
- *   panel 2 = deck    (v: port sheer -> starboard sheer)
- * `side` is +1 starboard / -1 port and is ignored by the deck.
+ * `side` is +1 starboard / -1 port.
  */
 function hullPoint(u: number, panel: number, v: number, side: number, out: Vector3): Vector3 {
   const z = stationZ(u);
-  const hb = beamAt(u);
+  const rk = rakeAt(u);
+  const rh = beamAt(u);
+  const ch = chineHalf(u);
   const cy = chineYAt(u);
+  const ry = cy + RAIL_H;
   const ky = cy - deadriseAt(u);
   const sy = sheerYAt(u);
-  const db = deckHalfAt(u);
-  const rk = rakeAt(u);
+  const dh = deckHalfAt(u);
+  // The rake is strongest at the keel and dies out by the deck: that difference
+  // IS the stem rake. Deck bow at z = 2.30, forefoot at z = 1.60.
   const keelZ = z - rk;
-  const chineZ = z - rk * 0.55;
+  const chineZ = z - rk * 0.52;
+  const railZ = z - rk * 0.4;
+  const sheerZ = z - rk * 0.08;
 
-  if (panel === 0) {
-    // Planing surface. A ~18 mm convex bulge mid-panel; a dead-flat bottom
-    // takes the ramp as one uniform band and looks like cardboard.
-    const bulge = Math.sin(Math.PI * v) * 0.018;
-    return out.set(side * hb * v, lerp(ky, cy, v) - bulge, lerp(keelZ, z - rk * 0.55, v));
+  if (panel === P_BOT) {
+    const j = Math.round(v * (BOT_ROWS - 1));
+    const s = BOTTOM_S[j];
+    const dy = BOTTOM_DY[j];
+    // A 10 mm convex bulge mid-panel on top of the strakes; a dead-flat bottom
+    // takes the ramp as one uniform band.
+    const bulge = Math.sin(Math.PI * s) * 0.01;
+    return out.set(side * ch * s, lerp(ky, cy, s) + dy - bulge, lerp(keelZ, chineZ, s));
   }
-  if (panel === 1) {
-    // Topside. Flares out 20 mm at mid-height before pulling back to the sheer,
-    // which is what gives the boat a shoulder instead of a slab side.
-    const flare = Math.sin(Math.PI * v) * 0.02;
-    return out.set(side * (lerp(hb, db, v) + flare), lerp(cy, sy, v), lerp(chineZ, z, v));
+
+  if (panel === P_RAIL) {
+    // Steps outboard AND up, so its face points outboard-and-DOWN. That is what
+    // a spray rail is, and it means the widest line on the boat is always a hard
+    // dark band whatever the sun does.
+    return out.set(side * lerp(ch, rh, v), lerp(cy, ry, v), lerp(chineZ, railZ, v));
   }
-  const x = (v * 2 - 1) * db;
-  const camber = 0.055 * (1 - (v * 2 - 1) * (v * 2 - 1));
-  return out.set(x, sy + camber, z);
+
+  if (panel === P_TOP) {
+    // Knuckle: the topside flares out to a hard kink at v = 0.286 and then pulls
+    // back in to the sheer. Below the kink the surface faces down (shadow band),
+    // above it faces up (light band) — one crease, two guaranteed values.
+    const kx = rh + 0.05 * (1 - 0.5 * u);
+    const x =
+      v <= KNUCKLE_V
+        ? lerp(rh, kx, v / KNUCKLE_V)
+        : lerp(kx, dh, (v - KNUCKLE_V) / (1 - KNUCKLE_V));
+    return out.set(side * x, lerp(ry, sy, v), lerp(railZ, sheerZ, v));
+  }
+
+  // Deck half: v = 0 at the sheer, v = 1 on the centreline. The two halves meet
+  // at the camber peak, so the deck carries a hard spine instead of being a slab.
+  const e = 1 - v;
+  const camber = 0.085 * (1 - e * e);
+  return out.set(side * dh * e, sy + camber, sheerZ);
 }
 
-/** Closed outline of a station, port-to-starboard around the section. */
+/**
+ * Closed outline of a station, port-to-starboard around the section. Every patch
+ * row is enumerated so the cap fans land on exactly the vertices the patches end
+ * on and the hull cannot leak.
+ */
 function sectionRing(u: number): Vector3[] {
   const ring: Vector3[] = [];
   const push = (panel: number, v: number, side: number) =>
     ring.push(hullPoint(u, panel, v, side, new Vector3()));
-  // up the starboard side from the keel
-  for (let i = 0; i <= 3; i++) push(0, i / 3, 1);
-  for (let i = 1; i <= 3; i++) push(1, i / 3, 1);
-  // across the deck, starboard -> port
-  for (let i = 1; i < 6; i++) push(2, 1 - i / 6, 1);
-  // down the port side back to the keel
-  for (let i = 3; i >= 1; i--) push(1, i / 3, -1);
-  for (let i = 3; i >= 1; i--) push(0, i / 3, -1);
+  for (let i = 0; i <= BOT_ROWS - 1; i++) push(P_BOT, i / (BOT_ROWS - 1), 1);
+  for (let i = 1; i <= RAIL_ROWS - 1; i++) push(P_RAIL, i / (RAIL_ROWS - 1), 1);
+  for (let i = 1; i <= TOP_ROWS - 1; i++) push(P_TOP, i / (TOP_ROWS - 1), 1);
+  for (let i = 1; i <= DECK_ROWS - 1; i++) push(P_DECK, i / (DECK_ROWS - 1), 1);
+  for (let i = DECK_ROWS - 2; i >= 0; i--) push(P_DECK, i / (DECK_ROWS - 1), -1);
+  for (let i = TOP_ROWS - 2; i >= 0; i--) push(P_TOP, i / (TOP_ROWS - 1), -1);
+  for (let i = RAIL_ROWS - 2; i >= 0; i--) push(P_RAIL, i / (RAIL_ROWS - 1), -1);
+  for (let i = BOT_ROWS - 2; i >= 1; i--) push(P_BOT, i / (BOT_ROWS - 1), -1);
   return ring;
 }
 
-/** The hull skin: seven patches, no welding between them. */
-function buildHullShell(): BufferGeometry {
-  const patches: BufferGeometry[] = [];
-  for (const side of [1, -1]) {
-    // du x dv points inboard on the starboard half (v runs outboard there), so
-    // the starboard patches need reversed winding and the port ones do not.
-    const flip = side > 0;
-    patches.push(gridPatch(STATIONS, 5, (u, v, o) => hullPoint(u, 0, v, side, o), flip));
-    patches.push(gridPatch(STATIONS, 4, (u, v, o) => hullPoint(u, 1, v, side, o), flip));
-  }
-  patches.push(gridPatch(STATIONS, 7, (u, v, o) => hullPoint(u, 2, v, 1, o)));
-  patches.push(capFan(sectionRing(0), true)); // transom, faces -Z
-  patches.push(capFan(sectionRing(1))); // stem sliver, faces +Z
-  return mergeSoup(patches);
-}
-
 // ---------------------------------------------------------------------------
-//  Superstructure: cowling, intakes, screen, bars, seat, footwells, nozzle, fin
+//  Hull livery
 // ---------------------------------------------------------------------------
-
-const COWL_Z0 = -0.15;
-const COWL_Z1 = 1.62;
-
-/** Cowling ridge height. Peaks at u = 0.35 (just ahead of the rider's hands)
- *  and rakes down to the nose, which is what makes the profile read "forward". */
-function cowlTop(u: number): number {
-  return (
-    0.98 -
-    0.36 * Math.pow(Math.max(0, (u - 0.35) / 0.65), 1.6) -
-    0.14 * Math.pow(Math.max(0, (0.35 - u) / 0.35), 1.5)
-  );
-}
-const cowlHalf = (u: number) => 0.42 - 0.29 * Math.pow(Math.max(0, (u - 0.3) / 0.7), 1.5);
-/** Base line, sunk a few cm into the deck camber so no gap can ever show. */
-const cowlBase = (u: number) => 0.34 + 0.15 * u;
 
 /**
- * Superelliptic arch section. The 0.769 exponent (= 2/2.6) is the point where
- * the top goes flat enough to hold one ramp band while the shoulder stays sharp
- * enough for the Sobel pass to find it. A circular arch (exponent 1) smears the
- * terminator all the way round and the cowling loses its form.
+ * Topside graphic. Two white elements on the racer colour:
+ *   - a boot-top pinstripe hugging the spray rail, which separates the dark
+ *     lower hull from the light topside with a drawn line rather than a
+ *     shading accident;
+ *   - the racing stripe, whose lower edge KICKS UP through 0.36 of the topside
+ *     height between u = 0.44 and u = 0.60. That diagonal is the one piece of
+ *     asymmetry in the livery and it is what makes the boat look like it is
+ *     already moving.
  */
+function topsideTint(u: number, v: number): number {
+  const boot = 0.075 - v;
+  const lo = 0.34 + 0.36 * clamp01((u - 0.44) / 0.16);
+  const band = Math.min(v - lo, lo + 0.27 - v);
+  // 0.09 is just over one row of the 15-row topside patch.
+  return edgeSlot(Math.max(boot, band), S_LIGHT, S_PAPER, 0.09);
+}
+
+/** Under the knuckle and under the rail the hull is in its own shadow. */
+function topsideAO(_u: number, v: number): number {
+  if (v < KNUCKLE_V) return lerp(0.42, 0.72, v / KNUCKLE_V);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+//  Superstructure: cowling, intakes, screen, bars, seat, stern module
+// ---------------------------------------------------------------------------
+
+const COWL_Z0 = -0.18;
+const COWL_Z1 = 1.66;
+/** Superellipse exponent. 0.62 is flat enough on top to hold one ramp band and
+ *  sharp enough at the shoulder for the Sobel pass to find it. A circular arch
+ *  (exponent 1) smears the terminator all the way round. */
+const SE_P = 0.62;
+
+/** Cowling ridge height. Peaks at u = 0.40, just ahead of the rider's hands,
+ *  and rakes down to a chisel nose. 1.08 m — 10 cm taller than the old cowl. */
+function cowlTop(u: number): number {
+  return (
+    1.08 -
+    0.33 * Math.pow(Math.max(0, (u - 0.4) / 0.6), 1.3) -
+    0.15 * Math.pow(Math.max(0, (0.4 - u) / 0.4), 1.5)
+  );
+}
+const cowlHalf = (u: number) => 0.44 - 0.3 * Math.pow(Math.max(0, (u - 0.26) / 0.74), 1.45);
+/** Base line, sunk into the deck camber so no gap can ever show. */
+const cowlBase = (u: number) => 0.28 + 0.22 * u;
+
 function cowlPoint(u: number, v: number, out: Vector3): Vector3 {
   const a = (v * 2 - 1) * (Math.PI / 2);
   const s = Math.sin(a);
@@ -417,51 +618,119 @@ function cowlPoint(u: number, v: number, out: Vector3): Vector3 {
   const yb = cowlBase(u);
   const ht = cowlTop(u);
   return out.set(
-    hw * Math.sign(s) * Math.pow(Math.abs(s), 0.769),
-    yb + (ht - yb) * Math.pow(c, 0.769),
+    hw * Math.sign(s) * Math.pow(Math.abs(s), SE_P),
+    yb + (ht - yb) * Math.pow(c, SE_P),
     lerp(COWL_Z0, COWL_Z1, u)
   );
 }
 
+/** Height of the cowl skin at a given |x|. Inverts the superellipse so the
+ *  windscreen can be seated on the arch instead of floating above it. */
+function cowlYAt(u: number, x: number): number {
+  const hw = cowlHalf(u);
+  const r = Math.min(1, Math.abs(x) / Math.max(1e-4, hw));
+  const s = Math.pow(r, 1 / SE_P);
+  const c = Math.sqrt(Math.max(0, 1 - s * s));
+  return cowlBase(u) + (cowlTop(u) - cowlBase(u)) * Math.pow(c, SE_P);
+}
+
 function cowlRing(u: number): Vector3[] {
   const ring: Vector3[] = [];
-  for (let i = 0; i <= 12; i++) ring.push(cowlPoint(u, i / 12, new Vector3()));
+  for (let i = 0; i <= 18; i++) ring.push(cowlPoint(u, i / 18, new Vector3()));
   return ring;
 }
 
 /**
- * Side intake: a dark recess plate with three raked gill slats standing proud of
- * it. Cheaper and far more graphic than a modelled duct — in a cel frame an
- * intake is three black slashes and a shadow, so that is exactly what it is.
+ * Cowl livery: dark flanks, racer-coloured shoulders, a white crown flash that
+ * widens toward the nose. Regions only ever touch adjacent slots.
  */
-function intakeGeo(side: number): BufferGeometry {
-  // Band on the cowl flank the scoop is grafted onto. v ~0.985 sits low on the
-  // side, v ~0.895 sits about 16 cm higher — read off the superellipse, not
-  // guessed, so the scoop can never float off the surface or sink into it.
-  const U0 = 0.2;
-  const U1 = 0.54;
-  const V_LOW = 0.985;
-  const V_HIGH = 0.895;
-  /** Point on the cowl skin. a = 0 aft .. 1 forward, b = 0 low .. 1 high. */
+function cowlTint(u: number, v: number): number {
+  const c = Math.abs(v - 0.5);
+  const flank = c - 0.31;
+  if (flank > -0.06) return edgeSlot(flank, S_LIGHT, S_DARK, 0.07);
+  const halfW = 0.05 + 0.09 * clamp01((u - 0.24) / 0.6);
+  return edgeSlot(halfW - c, S_LIGHT, S_PAPER, 0.07);
+}
+
+/**
+ * Stern module. A rear cowl carrying the fin, two scoops and the jet nozzle, so
+ * the back of the boat is a machine instead of a blank transom. Runs from under
+ * the saddle tail to 20 mm short of the transom.
+ */
+const REAR_Z0 = -0.9;
+const REAR_Z1 = -2.28;
+const rearHalf = (u: number) => 0.31 + 0.08 * Math.sin(Math.PI * clamp01(u * 1.1)) - 0.09 * u;
+const rearTop = (u: number) => 0.42 + 0.2 * Math.sin(Math.PI * clamp01((u + 0.15) / 1.3));
+const REAR_BASE = 0.2;
+
+function rearPoint(u: number, v: number, out: Vector3): Vector3 {
+  const a = (v * 2 - 1) * (Math.PI / 2);
+  const s = Math.sin(a);
+  const c = Math.max(0, Math.cos(a));
+  const hw = rearHalf(u);
+  const ht = rearTop(u);
+  return out.set(
+    hw * Math.sign(s) * Math.pow(Math.abs(s), 0.58),
+    REAR_BASE + (ht - REAR_BASE) * Math.pow(c, 0.66),
+    lerp(REAR_Z0, REAR_Z1, u)
+  );
+}
+
+function rearRing(u: number): Vector3[] {
+  const ring: Vector3[] = [];
+  for (let i = 0; i <= 32; i++) ring.push(rearPoint(u, i / 32, new Vector3()));
+  return ring;
+}
+
+/**
+ * Rear cowl livery: dark flanks, light shoulders, and a PAIR of white flashes
+ * flanking the fin root. The stern faces away from the sun, so without a light
+ * graphic back there the whole aft third collapses into one dark mass.
+ *
+ * The two branches are arranged to meet at exactly S_LIGHT at c = 0.22, so the
+ * seam between them is invisible rather than a step.
+ */
+function rearTint(_u: number, v: number): number {
+  const c = Math.abs(v - 0.5);
+  if (c > 0.26) return edgeSlot(c - 0.34, S_LIGHT, S_DARK, 0.07);
+  return edgeSlot(0.055 - Math.abs(c - 0.155), S_LIGHT, S_PAPER, 0.035);
+}
+
+/**
+ * Side scoop: a dark recess plate with a proud shell standing off it. Cheaper
+ * and far more graphic than a modelled duct — in a cel frame an intake is a dark
+ * shape with a lip, so that is exactly what it is. Used on both the forward
+ * cowling and the stern module.
+ */
+interface ScoopSpec {
+  surf: (u: number, v: number, out: Vector3) => Vector3;
+  u0: number;
+  u1: number;
+  /** v on the *starboard* flank; the port side is mirrored to 1 - v. */
+  vLow: number;
+  vHigh: number;
+  proud: number;
+  na: number;
+}
+
+function scoopGeo(side: number, sp: ScoopSpec): BufferGeometry {
   const skin = (a: number, b: number, out: Vector3) => {
-    const v = lerp(V_LOW, V_HIGH, b);
-    return cowlPoint(lerp(U0, U1, a), side > 0 ? v : 1 - v, out);
+    const v = lerp(sp.vLow, sp.vHigh, b);
+    return sp.surf(lerp(sp.u0, sp.u1, a), side > 0 ? v : 1 - v, out);
   };
-  /** Same point pushed out along ±X. The scoop is flush aft and 6 cm proud at
-   *  the forward lip, so the mouth faces into the airflow. */
+  /** Same point pushed out along ±X. Flush aft, proud at the forward lip, so the
+   *  mouth faces into the airflow. */
   const shell = (a: number, b: number, out: Vector3) => {
     skin(a, b, out);
-    out.x += side * 0.06 * Math.pow(a, 0.8);
-    // Round the shell in slightly at the top and bottom edges.
+    out.x += side * sp.proud * Math.pow(a, 0.8);
     out.y += (b - 0.5) * -0.012;
     return out;
   };
 
-  const NA = 6;
+  const NA = sp.na;
   const parts: BufferGeometry[] = [];
-  // Outer skin of the scoop. Winding flips with the mirror as everywhere else.
-  parts.push(paintConst(gridPatch(NA, 3, shell, side > 0), 0, 0.95));
-  // Inner floor, lifted 4 mm off the cowl to stay out of z-fighting range.
+  parts.push(paintConst(gridPatch(NA, 3, shell, side > 0), S_DARK, 0.9));
+  // Inner floor, lifted 4 mm off the skin to stay out of z-fighting range.
   parts.push(
     paintConst(
       gridPatch(
@@ -473,11 +742,10 @@ function intakeGeo(side: number): BufferGeometry {
         },
         side < 0
       ),
-      1,
+      S_INK,
       0.1
     )
   );
-  // Top and bottom lips joining shell to skin, plus the forward mouth ring.
   const s0 = new Vector3();
   const s1 = new Vector3();
   const k0 = new Vector3();
@@ -494,12 +762,11 @@ function intakeGeo(side: number): BufferGeometry {
       const g = flip
         ? quad(s0.clone(), k0.clone(), k1.clone(), s1.clone())
         : quad(s0.clone(), s1.clone(), k1.clone(), k0.clone());
-      parts.push(paintConst(g, 0, 0.5));
+      parts.push(paintConst(g, S_DARK, 0.5));
     }
   }
-  // Forward mouth. Left as a flat dark face rather than a modelled duct: in a
-  // cel frame an air intake IS a dark shape, and a real hole would show the
-  // back faces of the cowling through it.
+  // Forward mouth. A flat ink face rather than a modelled duct: in a cel frame
+  // an air intake IS a dark shape, and a real hole would show back faces.
   shell(1, 0, s0);
   shell(1, 1, s1);
   skin(1, 0, k0);
@@ -508,15 +775,18 @@ function intakeGeo(side: number): BufferGeometry {
     side > 0
       ? quad(s0.clone(), s1.clone(), k1.clone(), k0.clone())
       : quad(s0.clone(), k0.clone(), k1.clone(), s1.clone());
-  parts.push(paintConst(mouth, 1, 0.06));
+  parts.push(paintConst(mouth, S_INK, 0.06));
   return mergeSoup(parts);
 }
 
-/** Windscreen. Leans back 0.16 m over its height and wraps 0.10 m at the edges. */
+/** Windscreen. Seated on the cowl arch, wrapped, leaning back over its height. */
 function screenPoint(u: number, v: number, out: Vector3): Vector3 {
-  const w = lerp(0.26, 0.205, u);
   const e = v * 2 - 1;
-  return out.set(e * w, lerp(0.895, 1.235, u), 1.3 - 0.16 * u - 0.1 * e * e);
+  const x = e * lerp(0.25, 0.19, u);
+  const z = 1.26 - 0.17 * u - 0.11 * e * e;
+  const cu = clamp01((z - COWL_Z0) / (COWL_Z1 - COWL_Z0));
+  const y0 = cowlYAt(cu, x) - 0.02;
+  return out.set(x, y0 + u * (0.34 - 0.1 * e * e), z);
 }
 
 /** Round tube swept along a path. Used for the handlebar and the jet nozzle. */
@@ -545,11 +815,11 @@ function tubeGeo(
 }
 
 // Handlebar path. Swept back at the ends (a straight bar looks like a broomstick)
-// and lifted very slightly so the grips sit above the clamp.
-const BAR_HALF = 0.34;
+// and lifted to clear the taller cowl — the grips sit 9 cm above the crown.
+const BAR_HALF = 0.35;
 const barX = (s: number) => (s * 2 - 1) * BAR_HALF;
-const barY = (s: number) => 1.03 + 0.02 * (s * 2 - 1) * (s * 2 - 1);
-const barZ = (s: number) => 0.56 - 0.09 * (s * 2 - 1) * (s * 2 - 1);
+const barY = (s: number) => 1.2 + 0.02 * (s * 2 - 1) * (s * 2 - 1);
+const barZ = (s: number) => 0.52 - 0.1 * (s * 2 - 1) * (s * 2 - 1);
 /** Grips start at 65% of the half-span; fatter, so the hands have something to sit on. */
 const barR = (s: number) => (Math.abs(s * 2 - 1) > 0.65 ? 0.042 : 0.026);
 
@@ -559,8 +829,8 @@ function seatPoint(u: number, v: number, out: Vector3): Vector3 {
   // Top line dips in the middle (that dip is what a saddle *is*) and kicks up
   // at the back so the rider is not going to slide off under boost.
   const top = 0.775 - 0.075 * Math.sin(Math.PI * Math.min(1, u / 0.85)) + 0.035 * (1 - u);
-  const hw = 0.19 + 0.09 * Math.sin(Math.PI * clamp01((u + 0.1) / 1.1));
-  const base = 0.40;
+  const hw = 0.16 + 0.075 * Math.sin(Math.PI * clamp01((u + 0.1) / 1.1));
+  const base = 0.4;
   const a = (v * 2 - 1) * (Math.PI / 2);
   const s = Math.sin(a);
   const c = Math.max(0, Math.cos(a));
@@ -571,56 +841,83 @@ function seatPoint(u: number, v: number, out: Vector3): Vector3 {
   );
 }
 
-/** Stern jet nozzle: outer cone, inner cone, and a black throat disc. */
+/** Stern jet nozzle: flared outer cone, inner cone, black throat disc. 20% wider
+ *  than the old one and pushed 8 cm further aft so it clears the transom and
+ *  actually reads from a chase camera. */
+const NOZZLE_Y = 0.21;
 function nozzleGeo(): BufferGeometry {
-  const NY = 0.17;
   const outer = tubeGeo(
     3,
     12,
-    (s, o) => o.set(0, NY, lerp(-2.02, -2.34, s)),
-    (s) => lerp(0.175, 0.235, s), // flares aft — reads as thrust even parked
+    (s, o) => o.set(0, NOZZLE_Y, lerp(-2.04, -2.36, s)),
+    (s) => lerp(0.17, 0.235, s), // flares aft — reads as thrust even parked
     'z'
   );
   const inner = tubeGeo(
     3,
     12,
-    (s, o) => o.set(0, NY, lerp(-2.34, -2.06, s)),
-    (s) => lerp(0.205, 0.15, s),
+    (s, o) => o.set(0, NOZZLE_Y, lerp(-2.36, -2.08, s)),
+    (s) => lerp(0.205, 0.145, s),
     'z'
   );
   const throat: Vector3[] = [];
   for (let i = 0; i < 12; i++) {
     const a = (i / 12) * Math.PI * 2;
-    throat.push(new Vector3(Math.sin(a) * 0.15, NY + Math.cos(a) * 0.15, -2.06));
+    throat.push(new Vector3(Math.sin(a) * 0.145, NOZZLE_Y + Math.cos(a) * 0.145, -2.08));
   }
   return mergeSoup([
-    paintConst(outer, 0, 0.9),
-    paintConst(inner, 1, 0.2),
-    paintConst(capFan(throat), 1, 0.05),
+    paintConst(outer, S_DARK, 0.9),
+    paintConst(inner, S_INK, 0.2),
+    paintConst(capFan(throat), S_INK, 0.05),
   ]);
 }
 
-/** Tail fin, in the YZ plane. Convex quad so the cap fans stay well-formed. */
+/** Two short fairings bracing the nozzle to the stern module, at ±53° off
+ *  vertical so neither one fouls the fin. Pure silhouette work: they put hard
+ *  diagonals either side of the exhaust. Kept stubby — at 0.40 m they stuck out
+ *  past the transom and the stern read as a grabber claw. */
+function nozzleStrutGeo(): BufferGeometry {
+  const parts: BufferGeometry[] = [];
+  for (const rz of [0.92, -0.92]) {
+    const g = extrudeXY(
+      [
+        [-0.035, 0.16],
+        [0.035, 0.16],
+        [0.024, 0.3],
+        [-0.024, 0.3],
+      ],
+      0.3
+    );
+    parts.push(paintConst(place(g, 0, NOZZLE_Y, -2.22, 0, 0, rz), S_LIGHT, 0.8));
+  }
+  return mergeSoup(parts);
+}
+
+/** Tail fin: a swept dorsal with a raked leading edge, running 1.25 m along the
+ *  stern module. Convex so the cap fans stay well-formed. */
+const FIN_Z0 = -2.2;
+const FIN_Y0 = 0.3;
 function finGeo(): BufferGeometry {
   const g = extrudeXY(
     [
-      [0, 0],
-      [0.95, 0],
-      [0.72, 0.72],
-      [0.16, 0.8],
+      [0.0, 0.0],
+      [1.25, 0.0],
+      [1.02, 0.55],
+      [0.46, 0.86],
+      [0.06, 0.8],
     ],
-    0.07
+    0.075
   );
   // Profile x -> world z, profile thickness -> world x.
-  return place(g, 0, 0.3, -2.15, 0, -Math.PI / 2, 0);
+  return place(g, 0, FIN_Y0, FIN_Z0, 0, -Math.PI / 2, 0);
 }
 
 // ---------------------------------------------------------------------------
-//  Racer number — canvas badge on both faces of the fin
+//  Racer number — canvas badge on the fin and on both hull flanks
 // ---------------------------------------------------------------------------
 
 /**
- * Hand-drawn badge: flat plate, 6 px ink keyline, ink numeral. No gradients, no
+ * Hand-drawn badge: flat plate, ink keyline, ink numeral. No gradients, no
  * shadows — it has to survive next to the rest of the ink work without looking
  * like a decal from a different game.
  */
@@ -715,13 +1012,35 @@ function numberMaterial(tex: CanvasTexture): ShaderMaterial {
         if (!gl_FrontFacing) n = -n;
         float ndl = dot(n, normalize(uSunDir)) * 0.5 + 0.5;
         // Three steps chosen to match DEFAULT_RAMP's 0.44 / 0.545 thresholds so
-        // the badge changes band on the same terminator as the fin behind it.
+        // the badge changes band on the same terminator as the surface behind it.
         float band = ndl < 0.44 ? 0.60 : (ndl < 0.545 ? 0.88 : 1.10);
         gl_FragColor = vec4(tx.rgb * band * uSunColor, 1.0);
       }
     `,
     side: DoubleSide,
   });
+}
+
+/**
+ * Number panel on a hull flank. Follows the topside skin 18 mm proud of it, so
+ * it curves with the boat instead of hovering as a billboard. The u direction is
+ * reversed per side because on the starboard flank the stern is to screen-right
+ * and on the port flank it is to screen-left — the numeral has to read
+ * left-to-right from both.
+ */
+function numberPanelGeo(side: number): BufferGeometry {
+  const UF = 0.53; // forward end
+  const UA = 0.23; // aft end
+  return gridPatch(
+    6,
+    5,
+    (a, b, o) => {
+      const u = side > 0 ? lerp(UF, UA, a) : lerp(UA, UF, a);
+      hullPoint(u, P_TOP, lerp(0.4, 0.95, b), side, o);
+      o.x += side * 0.018;
+    },
+    side > 0
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -811,8 +1130,8 @@ function flameMaterial(tint: Color): ShaderMaterial {
 /** Where the rider's hands go. Sampled from the bar path, never hand-typed. */
 const GRIP_E = 0.853; // fraction of the half-span at which the grips sit
 const GRIP_X = BAR_HALF * GRIP_E;
-const GRIP_Y = 1.03 + 0.02 * GRIP_E * GRIP_E;
-const GRIP_Z = 0.56 - 0.09 * GRIP_E * GRIP_E;
+const GRIP_Y = 1.2 + 0.02 * GRIP_E * GRIP_E;
+const GRIP_Z = 0.52 - 0.1 * GRIP_E * GRIP_E;
 /** Saddle contact patch, sampled from `seatPoint` at u = 0.72. */
 const SEAT_Y = 0.75;
 const SEAT_Z = -0.26;
@@ -823,96 +1142,137 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   const dark = PAL.racerDark[i];
 
   // ---- hull ---------------------------------------------------------------
-  const shell = buildHullShell();
-  paintTint(shell, (x, y, z) => {
-    const u = clamp01((z + HULL_HALF_LEN) / HULL_LEN);
-    const cy = chineYAt(u);
-    // Antifoul: everything below the chine goes to colour2. Because the chine
-    // is already a normal split, the paint edge lands exactly on a hard edge
-    // and reads as a masked line rather than a shading accident.
-    if (y <= cy + 0.01) return 1;
-    const sy = sheerYAt(u);
-    // Racing stripe at a CONSTANT FRACTION of the topside height, so it follows
-    // the sheer up to the bow instead of cutting across it. Returned as 0 or 1
-    // and never lerped — a soft edge here would read as an airbrush.
-    const f = (y - cy) / Math.max(0.02, sy - cy);
-    return f > 0.42 && f < 0.68 ? 1 : 0;
-  });
-  paintAO(shell, (x, y, z) => {
-    const u = clamp01((z + HULL_HALF_LEN) / HULL_LEN);
-    const cy = chineYAt(u);
-    let ao = 1;
-    // Tuck under the chine — the ramp drops a whole band here, which is what
-    // separates the wet bottom from the topside even in full sun.
-    const d = Math.abs(y - cy);
-    if (d < 0.07) ao = Math.min(ao, 0.6 + (d / 0.07) * 0.4);
-    // Deck under the cowling and saddle.
-    if (y > sheerYAt(u) - 0.02 && Math.abs(x) < 0.46 && z > -1.35 && z < 1.66)
-      ao = Math.min(ao, 0.5);
-    return ao;
-  });
-
-  const wells: BufferGeometry[] = [];
+  const patches: BufferGeometry[] = [];
   for (const side of [1, -1]) {
-    // Footwells: 1.30 m long, recessed 60 mm below the deck skin with a 70 mm
-    // proud rim, sitting outboard of the saddle where the rider's feet land.
-    const tray = place(trayGeo(0.34, 0.13, 1.3), side * 0.48, 0.28, -0.75);
-    paintTint(tray, () => 1);
-    paintAO(tray, (_x, y) => (y < 0.3 ? 0.14 : 0.38));
-    wells.push(tray);
+    // du x dv points inboard on the starboard half (v runs outboard there), so
+    // the starboard patches need reversed winding and the port ones do not.
+    const flip = side > 0;
+    patches.push(
+      paintUV(
+        gridPatch(STATIONS, BOT_ROWS, (u, v, o) => hullPoint(u, P_BOT, v, side, o), flip),
+        () => S_DARK,
+        (_u, v) => (v > 0.86 ? 0.62 : 1) // tuck under the chine
+      )
+    );
+    patches.push(
+      paintUV(
+        gridPatch(STATIONS, RAIL_ROWS, (u, v, o) => hullPoint(u, P_RAIL, v, side, o), flip),
+        () => S_DARK,
+        () => 0.5
+      )
+    );
+    patches.push(
+      paintUV(
+        gridPatch(STATIONS, TOP_ROWS, (u, v, o) => hullPoint(u, P_TOP, v, side, o), flip),
+        topsideTint,
+        topsideAO
+      )
+    );
+    patches.push(
+      paintUV(
+        gridPatch(STATIONS, DECK_ROWS, (u, v, o) => hullPoint(u, P_DECK, v, side, o), flip),
+        // Dark rubbing strake along the gunwale. 0.17 is one row of a 7-row deck.
+        (_u, v) => edgeSlot(0.1 - v, S_LIGHT, S_DARK, 0.17),
+        (u, v) => (v > 0.45 && u > 0.18 && u < 0.88 ? 0.55 : 1) // under the cowl
+      )
+    );
   }
-  const hullGeo = mergeSoup([shell, ...wells]);
+  // Transom and stem caps. The transom is the dark lower-hull colour: it is the
+  // one face that is always in shade, and keeping it dark is what stops the back
+  // of the boat reading as a cut-off slab.
+  patches.push(paintConst(capFan(sectionRing(0), true), S_DARK, 0.4));
+  patches.push(paintConst(capFan(sectionRing(1)), S_LIGHT, 0.8));
+
+  for (const side of [1, -1]) {
+    // Footwells: recessed trays outboard of the saddle where the rider's feet
+    // land, with a rim standing proud of the deck.
+    const tray = place(trayGeo(0.34, 0.13, 0.9), side * 0.48, 0.24, -0.8);
+    paintTint(tray, () => S_INK);
+    paintAO(tray, (_x, y) => (y < 0.28 ? 0.1 : 0.34));
+    patches.push(tray);
+  }
+
+  const hullGeo = mergeSoup(patches);
   ensureCelAttributes(hullGeo);
 
   const hullMat = celMaterial({
     color: light,
     color2: dark,
-    rim: 0.75,
+    // Rim pulled down hard from 0.75: at that strength every grazing face on the
+    // hull blew out to paper white and the bloom pass turned it into a halo.
+    rim: 0.42,
     rimColor: PAL.skyHorizon,
-    rimPower: 2.4,
+    rimPower: 2.6,
     specSize: 0.22,
-    specStrength: 0.55,
-    gradient: 0.3,
+    specStrength: 0.3,
+    gradient: 0, // the livery is the graphic; a vertical wash would fight it
+    uniforms: liveryUniforms(light, dark),
+    fragExtra: LIVERY_FRAG,
   });
+  declareLivery(hullMat);
   const hull = new Mesh(hullGeo, hullMat);
   hull.name = `boat${i}_hull`;
 
-  // ---- cowling + intakes + fin (one mesh: same paint, same material) ------
+  // ---- cowling + stern module + intakes + fin (one mesh, one material) -----
   const bodyGeo = mergeSoup([
-    gridPatch(16, 15, cowlPoint),
-    paintConst(capFan(cowlRing(1), true), 0, 0.85), // nose cap, faces +Z
-    paintConst(capFan(cowlRing(0)), 1, 0.2), // aft opening behind the bars
-    intakeGeo(1),
-    intakeGeo(-1),
-    paintConst(finGeo(), 1, 0.9),
+    paintUV(gridPatch(20, 19, cowlPoint), cowlTint),
+    paintConst(capFan(cowlRing(1), true), S_LIGHT, 0.85), // chisel nose, faces +Z
+    paintConst(capFan(cowlRing(0)), S_INK, 0.2), // aft opening behind the bars
+    scoopGeo(1, { surf: cowlPoint, u0: 0.16, u1: 0.52, vLow: 0.99, vHigh: 0.86, proud: 0.075, na: 7 }),
+    scoopGeo(-1, { surf: cowlPoint, u0: 0.16, u1: 0.52, vLow: 0.99, vHigh: 0.86, proud: 0.075, na: 7 }),
+    // The stern module's u runs aft, so du is -z and every winding is mirrored
+    // relative to the forward cowling: the patch flips, and the two cap fans
+    // swap their flip flags.
+    paintUV(gridPatch(16, 33, rearPoint, true), rearTint),
+    // Body colour, NOT the dark: this face always points away from the sun, and
+    // in racerDark it landed in ramp band 0 and punched a black hole through the
+    // middle of the transom from the chase camera.
+    paintConst(capFan(rearRing(1)), S_LIGHT, 0.72),
+    paintConst(capFan(rearRing(0), true), S_INK, 0.15),
+    // u0 > u1 on purpose: the stern module's u runs aft, so running a backwards
+    // puts the scoop mouth at the forward end (facing the airflow) AND leaves
+    // the patch's world-space du pointing the same way as the forward cowling's,
+    // which keeps the winding rules identical.
+    scoopGeo(1, {
+      surf: rearPoint,
+      u0: 0.52,
+      u1: 0.18,
+      vLow: 0.92,
+      vHigh: 0.8,
+      proud: 0.055,
+      na: 6,
+    }),
+    scoopGeo(-1, {
+      surf: rearPoint,
+      u0: 0.52,
+      u1: 0.18,
+      vLow: 0.92,
+      vHigh: 0.8,
+      proud: 0.055,
+      na: 6,
+    }),
+    paintConst(finGeo(), S_DARK, 0.9),
+    nozzleGeo(),
+    nozzleStrutGeo(),
   ]);
-  // Stripe the cowling with the same rule as the hull so the livery is one
-  // graphic across the whole boat rather than two decisions.
-  const bodyTint = bodyGeo.getAttribute('aTint') as BufferAttribute;
-  const bodyPos = bodyGeo.getAttribute('position') as BufferAttribute;
-  for (let k = 0; k < bodyPos.count; k++) {
-    if (bodyTint.getX(k) > 0.5) continue; // already dark (fin, intake mouths)
-    const y = bodyPos.getY(k);
-    const z = bodyPos.getZ(k);
-    const u = clamp01((z - COWL_Z0) / (COWL_Z1 - COWL_Z0));
-    const f = (y - cowlBase(u)) / Math.max(0.05, cowlTop(u) - cowlBase(u));
-    if (f > 0.30 && f < 0.52) bodyTint.setX(k, 1);
-  }
-  bodyTint.needsUpdate = true;
   ensureCelAttributes(bodyGeo);
 
   const bodyMat = celMaterial({
     color: light,
     color2: dark,
-    rim: 0.9,
-    rimPower: 2.2,
-    specSize: 0.16,
-    specStrength: 0.75,
+    rim: 0.38,
+    rimPower: 2.4,
+    specSize: 0.12,
+    specStrength: 0.28,
     // Fake reflection only on the moulded top surfaces — this is the one place
     // the boat is allowed to look glossy, and it is a quantised matcap doing it.
-    matcapStrength: 0.32,
-    gradient: 0.18,
+    // Kept low so the livery correction in LIVERY_FRAG stays accurate.
+    matcapStrength: 0.16,
+    gradient: 0,
+    uniforms: liveryUniforms(light, dark),
+    fragExtra: LIVERY_FRAG,
   });
+  declareLivery(bodyMat);
   const body = new Mesh(bodyGeo, bodyMat);
   body.name = `boat${i}_body`;
 
@@ -922,10 +1282,10 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   const screenMat = celMaterial({
     color: PAL.helmetVisor,
     color2: PAL.skyHorizon,
-    rim: 1.2,
+    rim: 0.9,
     rimPower: 1.8,
     specSize: 0.1,
-    specStrength: 1.1,
+    specStrength: 0.9,
     matcapStrength: 0.8,
     transparent: true,
     opacity: 0.42,
@@ -940,29 +1300,22 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   screen.renderOrder = 2;
   screen.userData.noOutline = true;
 
-  // ---- hardware: saddle, bars, stem, jet nozzle ---------------------------
-  const barGeo = tubeGeo(
-    26,
-    8,
-    (s, o) => o.set(barX(s), barY(s), barZ(s)),
-    barR,
-    'x'
-  );
+  // ---- hardware: saddle, bars, stem ---------------------------------------
+  const barGeo = tubeGeo(26, 8, (s, o) => o.set(barX(s), barY(s), barZ(s)), barR, 'x');
   const stem = extrudeXY(
     [
       [-0.06, 0],
       [0.06, 0],
-      [0.045, 0.16],
-      [-0.045, 0.16],
+      [0.045, 0.18],
+      [-0.045, 0.18],
     ],
     0.1
   );
-  place(stem, 0, 0.9, GRIP_Z + 0.04);
+  place(stem, 0, 1.05, GRIP_Z + 0.04);
   const gearGeo = mergeSoup([
     paintConst(gridPatch(12, 13, seatPoint), 0, 0.8),
     paintConst(barGeo, 1, 0.95),
     paintConst(stem, 1, 0.7),
-    nozzleGeo(),
   ]);
   ensureCelAttributes(gearGeo);
   const gear = new Mesh(
@@ -970,20 +1323,23 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
     celMaterial({
       color: PAL.suit,
       color2: PAL.inkSoft,
-      rim: 0.55,
+      // The saddle is a big smooth loft. At specStrength 0.5 / specSize 0.2 the
+      // broad highlight covered most of it and a navy saddle rendered mid-grey,
+      // which made it the second-largest pale mass on the boat. Tight and weak.
+      rim: 0.4,
       rimPower: 2.8,
-      specSize: 0.2,
-      specStrength: 0.5,
-      matcapStrength: 0.14,
+      specSize: 0.1,
+      specStrength: 0.16,
+      matcapStrength: 0.06,
     })
   );
   gear.name = `boat${i}_gear`;
 
-  // ---- racer number, one badge per fin face -------------------------------
+  // ---- racer number: one badge per fin face, one panel per hull flank ------
   const numTex = makeNumberTexture(i);
-  const px = 0.037; // fin half-thickness (0.035) + 2 mm standoff
+  const px = 0.04; // fin half-thickness (0.0375) + 2.5 mm standoff
   const z0 = -1.98;
-  const z1 = -1.44;
+  const z1 = -1.45;
   const y0 = 0.44;
   const y1 = 0.94;
   const V = (a: number, b: number, c: number) => new Vector3(a, b, c);
@@ -992,6 +1348,8 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
     quad(V(px, y0, z1), V(px, y0, z0), V(px, y1, z0), V(px, y1, z1)),
     // port: u increases toward the bow, for the same reason
     quad(V(-px, y0, z0), V(-px, y0, z1), V(-px, y1, z1), V(-px, y1, z0)),
+    numberPanelGeo(1),
+    numberPanelGeo(-1),
   ]);
   const number = new Mesh(plates, numberMaterial(numTex));
   number.name = `boat${i}_number`;
@@ -1002,7 +1360,7 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   const flameMat = flameMaterial(light);
   const flame = new Mesh(flameGeo(), flameMat);
   flame.name = `boat${i}_flame`;
-  flame.position.set(0, 0.17, -2.3); // the nozzle throat
+  flame.position.set(0, NOZZLE_Y, -2.34); // the nozzle throat
   flame.visible = false;
   flame.frustumCulled = false;
   flame.userData.noOutline = true;
@@ -1030,11 +1388,11 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
   // draw-call budget; BoatParts types them as Object3D precisely so they can be
   // attachment points. Nine draw calls per boat including the three ink shells.
   const nose = new Object3D();
-  nose.position.set(0, 0.62, COWL_Z1);
+  nose.position.set(0, 0.66, COWL_Z1);
   const engine = new Object3D();
-  engine.position.set(0, 0.17, -2.18);
+  engine.position.set(0, NOZZLE_Y, -2.2);
   const fin = new Object3D();
-  fin.position.set(0, 0.3, -2.15);
+  fin.position.set(0, FIN_Y0 + 0.5, FIN_Z0 + 0.5);
   const seat = new Object3D();
   seat.position.set(0, SEAT_Y, SEAT_Z);
   root.add(nose, engine, fin, seat);
@@ -1049,5 +1407,3 @@ export function buildBoatMesh(index: number): { root: Object3D; parts: BoatParts
 
   return { root, parts: { hull, nose, engine, fin, seat } };
 }
-
-

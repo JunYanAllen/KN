@@ -4,6 +4,7 @@ import {
   BufferGeometry,
   CatmullRomCurve3,
   Color,
+  DoubleSide,
   DynamicDrawUsage,
   InstancedBufferAttribute,
   InstancedMesh,
@@ -26,7 +27,6 @@ import {
   computeSmoothNormals,
   ensureCelAttributes,
   paintAO,
-  paintTint,
 } from '../render/CelMaterial';
 import { GERSTNER_GLSL, WAVE_MAX_HEIGHT, sampleHeight, sampleNormal } from '../water/Gerstner';
 
@@ -193,10 +193,26 @@ const BUOY_CULL_SQ = 560 * 560;
 const BUOY_NORMAL_SQ = 220 * 220;
 
 const RIBBON_SEGMENTS = 1040;
-const RIBBON_HALF_WIDTH = 2.5; // 5 m wide, comfortably inside every gate
+/** 2.8 m overall. It was 5 m and at chase-camera height a 5 m strip laid on the
+ *  sea covers something like 40% of the frame — it stops guiding the eye and
+ *  starts carpeting the picture. 2.8 m is a little under one hull width, which
+ *  is what a painted racing line should be: something you straddle, not
+ *  something you drive along inside of. */
+const RIBBON_HALF_WIDTH = 1.4;
+/** Fraction of the half-width taken by each bright outer rail. 0.30 of 1.4 m is
+ *  a 0.42 m rail — about three device pixels at 40 m, so it survives the
+ *  distance fade as a line rather than dissolving into the fill. */
+const RIBBON_RAIL = 0.74; // rail starts at |side| > 0.74, i.e. a 0.36 m rail
 /** Nominal chevron pitch, snapped at build time so the pattern tiles the lap
- *  exactly and there is no seam where u wraps from 1 back to 0. */
-const CHEVRON_PITCH = 9.0;
+ *  exactly and there is no seam where u wraps from 1 back to 0. Halved with the
+ *  width so the arrowheads keep roughly their old aspect and read as crisp
+ *  marks instead of long tapering wedges. */
+const CHEVRON_PITCH = 5.0;
+
+/** Half-length of the fore/aft arm the gate's pitch is measured over, metres. */
+const GATE_ARM = 14;
+/** How much of the measured slope a moored gate actually takes up. */
+const GATE_TILT_DAMP = 0.55;
 
 const BUOY_MAX = 84;
 /** Buoys mark the outside of anything tighter than this. R = 230 catches the
@@ -280,12 +296,45 @@ function translateGeo(g: BufferGeometry, x: number, y: number, z: number): Buffe
 }
 
 /**
+ * Per-TRIANGLE tint, evaluated at the face centroid and written to all three of
+ * its vertices.
+ *
+ * `paintTint` samples per vertex, so any pattern finer than the mesh's own edge
+ * spacing gets linearly interpolated across the face — which is exactly what
+ * turned the gate banner's 3.2 m stripes into the soft diagonal smear in
+ * countdown.png (the banner had 18 segments over 60 m, i.e. 3.4 m quads, so
+ * every stripe boundary fell INSIDE a quad and was blended). Snapping the
+ * pattern to whole faces makes it perfectly hard-edged, which is the only way
+ * flat-fill cel work reads as drawn rather than shaded. Geometry must be
+ * non-indexed (everything built in this file is).
+ */
+function paintTintFaceted(geo: BufferGeometry, fn: (x: number, y: number, z: number) => number): void {
+  const pos = geo.getAttribute('position') as BufferAttribute;
+  const p = pos.array as Float32Array;
+  const a = new Float32Array(pos.count);
+  for (let i = 0; i < pos.count; i += 3) {
+    const o = i * 3;
+    const cx = (p[o] + p[o + 3] + p[o + 6]) / 3;
+    const cy = (p[o + 1] + p[o + 4] + p[o + 7]) / 3;
+    const cz = (p[o + 2] + p[o + 5] + p[o + 8]) / 3;
+    const v = fn(cx, cy, cz);
+    a[i] = v;
+    a[i + 1] = v;
+    a[i + 2] = v;
+  }
+  geo.setAttribute('aTint', new BufferAttribute(a, 1));
+}
+
+/**
  * The gate banner: a slab spanning the pylons with a catenary sag. Built as a
  * strip of quads (front, back, top, bottom) rather than a BoxGeometry so the
  * sag can be applied to the centreline and the caps stay square.
+ *
+ * `seg` is chosen by the caller so that ONE QUAD IS ONE STRIPE — see
+ * `paintTintFaceted`. That is the whole reason this takes a segment count.
  */
-function makeBanner(span: number, y: number, h: number, thick: number, sag: number): BufferGeometry {
-  const SEG = 18;
+function makeBanner(span: number, y: number, h: number, thick: number, sag: number, seg: number): BufferGeometry {
+  const SEG = seg;
   const tri: number[] = [];
   const x = (i: number) => -span * 0.5 + (span * i) / SEG;
   // Sag profile: a half sine, deepest in the middle. A real banner between two
@@ -332,56 +381,113 @@ function makeBanner(span: number, y: number, h: number, thick: number, sag: numb
  * the mean slope rather than having each pylon bob independently.
  */
 function buildGateGeometry(width: number): BufferGeometry {
-  // Pylon profile (radius, height). The waterline is y = 0; the float belly is
-  // below it, the collar sits right at it, the mast carries the banner.
+  // ---- pylon profile (radius, height) ------------------------------------
+  // This is a MARKER BUOY, not a stick. Reading it bottom to top: a weighted
+  // belly below the waterline, the widest point just under y = 0, a hard collar
+  // flare exactly at the waterline (that step is what says "this thing floats"
+  // — a smooth taper says "this thing was extruded"), a shoulder into the mast,
+  // a raised hazard ring, the boss the banner bolts to, and a lamp housing with
+  // a dome on top.
+  //
+  // It also got SHORT. The old mast put the banner at y = 8.15 with a 2.3 m
+  // face on it, and from anywhere near the start line that is a plank across
+  // the top third of the frame. The whole structure is now 6.0 m out of the
+  // water instead of 9.1, and the banner face is 1.15 m instead of 2.3.
   // prettier-ignore
   const pylon = [
-    0.00, -2.80,
-    1.70, -2.35,
-    2.35, -1.15,
-    2.45,  0.10,
-    2.10,  0.75,
-    0.95,  1.35,
-    0.62,  3.35,
-    0.62,  4.95,
-    0.55,  7.60,
-    1.45,  8.05,
-    1.25,  8.75,
-    0.00,  9.05,
+    0.00, -2.10,   // keel
+    1.05, -1.80,
+    1.62, -1.05,
+    1.78, -0.25,   // widest, just under the waterline
+    1.74,  0.30,
+    1.90,  0.60,   // COLLAR — hard flare at the waterline
+    1.32,  0.86,
+    0.96,  0.98,
+    0.52,  1.18,   // shoulder into the mast
+    0.44,  1.58,
+    0.68,  1.72,   // hazard ring, a real step not a painted line
+    0.68,  2.28,
+    0.44,  2.42,
+    0.44,  3.14,
+    0.76,  3.28,   // banner boss
+    0.76,  4.32,
+    0.44,  4.46,
+    0.44,  4.90,
+    0.88,  5.04,   // lamp housing
+    0.88,  5.48,
+    0.60,  5.62,   // lens shoulder
+    0.42,  5.86,   // lens dome
+    0.00,  5.98,
   ];
+
+  const BANNER_Y = 3.80;
+  const BANNER_H = 1.15;
+  const BANNER_T = 0.52; // 2.2 : 1 face-to-thickness — a beam, not a sheet of card
+  const STRIPE = 2.0; // hazard stripe pitch, was 3.2
+  const span = width - 1.4;
+  // One quad per stripe, so `paintTintFaceted` can snap the pattern to faces.
+  const seg = Math.max(12, Math.round(span / STRIPE));
+
   const half = width * 0.5;
   const parts: BufferGeometry[] = [
-    translateGeo(facetedLathe(pylon, 9), -half, 0, 0),
-    translateGeo(facetedLathe(pylon, 9), half, 0, 0),
-    makeBanner(width - 1.4, 8.15, 2.3, 0.45, Math.min(1.7, width * 0.035)),
+    translateGeo(facetedLathe(pylon, 10), -half, 0, 0),
+    translateGeo(facetedLathe(pylon, 10), half, 0, 0),
+    makeBanner(span, BANNER_Y, BANNER_H, BANNER_T, Math.min(0.75, width * 0.013), seg),
   ];
   const geo = mergeGeos(parts);
 
-  // aTint = 1 picks up uColor2 (cream) — the collar band, one mast band, and
-  // alternating banner stripes. Painting it into the mesh instead of using a
-  // texture keeps us at zero assets and keeps the bands perfectly hard-edged.
-  paintTint(geo, (x, y) => {
-    if (y > 6.9) {
-      // Banner + mast head: 3.2 m stripes. The +1000 keeps the floor() well
-      // away from zero so the pattern does not mirror across the centreline.
-      return Math.floor((x + 1000) / 3.2) % 2 === 0 ? 1 : 0;
+  // aTint picks up uColor2 (cream): 1 = cream, 2 = cream AND the always-on lamp
+  // (the shader's mix() clamps, so 2 shades identically; the extra bit is read
+  // by fragExtra). Painting it into the mesh instead of using a texture keeps us
+  // at zero assets and keeps the bands perfectly hard-edged.
+  const bannerLeft = -span * 0.5;
+  paintTintFaceted(geo, (x, y, z) => {
+    const inBanner = Math.abs(x) < half - 0.85 && y > BANNER_Y - 1.6 && y < BANNER_Y + 1.0;
+    if (inBanner) {
+      // Top face, bottom face and the two end caps all have their vertices
+      // split across +/- the half-thickness, so their centroid sits at |z| =
+      // T/6, while the striped front and back faces sit at |z| = T/2. That one
+      // test separates "edge of the beam" from "face of the beam" without
+      // caring where the catenary sag has pushed this segment.
+      if (Math.abs(z) < BANNER_T * 0.3) return 1; // cream edge — reads as thickness
+      return Math.floor((x - bannerLeft) / STRIPE) % 2 === 0 ? 1 : 0;
     }
-    if (y > -1.2 && y < 0.85) return 1; // waterline collar
-    if (y > 3.3 && y < 5.0) return 1; // mast band
-    return 0;
+    if (y > 4.94) return 2; // LAMP: housing + lens, emissive
+    if (y > 1.68 && y < 2.34) return 1; // hazard ring on the mast
+    if (y > -0.35 && y < 0.92) return 1; // waterline collar
+    return 0; // orange: float belly, mast, banner boss
   });
-  // Occlusion: under the collar and inside the mast/banner junction.
-  paintAO(geo, (x, y) => {
+
+  // Occlusion: under the float, under the collar, under the boss and under the
+  // lamp housing. Each one drops a whole ramp band, which is what makes a
+  // ten-sided lathe read as stacked forms instead of one tapered horn.
+  paintAO(geo, (_x, y) => {
     let ao = 1;
-    if (y < -0.9) ao -= 0.45 * clamp((-0.9 - y) / 1.6, 0, 1);
-    if (y > 0.85 && y < 1.6) ao -= 0.3;
-    if (y > 7.3 && y < 8.2) ao -= 0.22;
+    if (y < -0.45) ao -= 0.5 * clamp((-0.45 - y) / 1.5, 0, 1);
+    if (y > 0.9 && y < 1.5) ao -= 0.34;
+    if (y > 3.05 && y < 3.34) ao -= 0.26;
+    if (y > 4.84 && y < 5.1) ao -= 0.26;
     return clamp(ao, 0.25, 1);
   });
   computeSmoothNormals(geo);
   ensureCelAttributes(geo);
   return geo;
 }
+
+/** Always-on navigation lamp: aTint == 2 marks the lens at the top of each
+ *  pylon. Doing it in `fragExtra` rather than as a second mesh keeps the gate
+ *  at one draw call plus one ink shell.
+ *
+ *  It reuses `uEmissive` (which this material sets to PAL.gateLit) rather than
+ *  declaring a colour of its own — `celMaterial` has no injection point for
+ *  fragment-stage uniform DECLARATIONS, only for the body, so a bespoke uniform
+ *  would fail to compile. Note this is deliberately NOT scaled by
+ *  uEmissiveStrength: the lamp burns all the time, the strength uniform is the
+ *  separate checkpoint-taken flash for the whole structure. */
+const GATE_FRAG_EXTRA = /* glsl */ `
+  float lamp = step(1.5, vTint);
+  celColor = mix(celColor, uEmissive, lamp * 0.9);
+`;
 
 /** A marker buoy: weighted float, collar, short mast, chevron cap. */
 function buildBuoyGeometry(): BufferGeometry {
@@ -397,7 +503,7 @@ function buildBuoyGeometry(): BufferGeometry {
     0.00,  3.10,
   ];
   const geo = facetedLathe(profile, 8);
-  paintTint(geo, (_x, y) => (y > -0.15 && y < 0.7 ? 1 : y > 2.4 ? 1 : 0));
+  paintTintFaceted(geo, (_x, y) => (y > -0.15 && y < 0.7 ? 1 : y > 2.4 ? 1 : 0));
   paintAO(geo, (_x, y) => clamp(y < -0.6 ? 0.55 : y < 0.7 ? 0.82 : 1, 0.3, 1));
   computeSmoothNormals(geo);
   ensureCelAttributes(geo);
@@ -442,7 +548,11 @@ void main() {
   // pixel is this many world units at this depth.
   float pxWorld = (2.0 * uTanHalfFov * dist) / uPixelHeight;
   mv.xyz += normalize(normalMatrix * n) * clamp(uWidthPx * pxWorld, 0.004, 0.6);
-  vFade = smoothstep(1400.0, 700.0, dist);
+  // Well-defined form. GLSL leaves smoothstep undefined for edge0 >= edge1 and
+  // the software rasteriser sorts the edges, which inverted this: the ink was
+  // being discarded on every buoy inside 700 m — i.e. on every buoy you can
+  // actually see — and drawn only on the ones past 1400 m.
+  vFade = 1.0 - smoothstep(700.0, 1400.0, dist);
   gl_Position = projectionMatrix * mv;
 }
 `;
@@ -527,12 +637,20 @@ void main() {
 
   float dist = max(1.0, -(viewMatrix * vec4(surf, 1.0)).z);
 
-  // 0.15 m of lift. The ocean mesh is tessellated, so its drawn surface sits a
-  // few centimetres below the analytic one on a crest; 0.15 m clears that
-  // everywhere inside ~200 m without the ribbon ever reading as hovering. The
-  // linear term buys back depth-buffer precision further out, where 0.15 m is
-  // worth less than one depth increment.
-  surf += nrm * (0.15 + dist * 0.0016);
+  // 0.13 m of lift. The ocean mesh is tessellated, so its drawn surface sits a
+  // few centimetres below the analytic one on a crest; 0.13 m clears that
+  // everywhere inside ~200 m without the ribbon ever reading as hovering.
+  //
+  // The linear term used to be 0.0016 and the rest of the far-field z-fight was
+  // handled with polygonOffsetFactor = -3. That factor is multiplied by the
+  // depth SLOPE, and a strip lying flat on the sea seen from a chase camera one
+  // metre off the water has an enormous slope — so the offset was pushing the
+  // ribbon metres toward the camera, which is what made it draw over the
+  // player's hull and what threw those detached green shards up next to the
+  // distant gates. Polygon offset is gone; this term replaces it. Depth
+  // precision here is ~1.7e-7 * z^2 m, so 0.003 * z is 40+ increments of margin
+  // at every distance the ribbon is still visible at.
+  surf += nrm * (0.13 + dist * 0.0030);
 
   vSide  = aSide;
   vDist  = aDist;
@@ -549,9 +667,11 @@ precision highp float;
 
 uniform vec3  uLine;
 uniform vec3  uHot;
+uniform vec3  uFill;
 uniform float uTime;
 uniform float uPitch;
 uniform float uScroll;
+uniform float uRail;
 uniform float uFadeNear;
 uniform float uFadeFar;
 
@@ -563,38 +683,77 @@ varying float vTilt;
 void main() {
   float a = abs(vSide);
 
+  // =========================================================================
+  //  This is EMISSIVE INK ON THE SURFACE, not a sheet of green cellophane laid
+  //  over it. The whole strip is near-opaque, so the water bands do NOT pass
+  //  through it and it can never tint the sea underneath; the only place the
+  //  water shows is the one-pixel feather at the very outside of each rail.
+  //  The read is: two hard bright rails with a quieter fill between them, i.e.
+  //  a painted lane, which is what a racing line looks like.
+  // =========================================================================
+
+  // ---- edge rails ---------------------------------------------------------
+  // Analytic AA from the screen-space derivative of the across coordinate, so
+  // the rail is exactly one pixel soft at any distance and any grazing angle.
+  float aw   = clamp(fwidth(a) * 0.9, 0.0015, 0.45);
+  float rail = smoothstep(uRail - aw, uRail + aw, a);
+  float core = 1.0 - rail;
+  // Kill the outermost sliver. This is the ONLY place the sea shows through:
+  // a ~1 px feather that stops the strip cutting the water with a hard
+  // staircase where it is almost parallel to the view ray.
+  float edge = 1.0 - smoothstep(1.0 - max(aw, 0.02), 1.0, a);
+
   // ---- scrolling chevrons -------------------------------------------------
   // Skewing the along-coordinate by the distance from the centreline bends the
-  // dash boundary into an arrowhead. 2.6 m of skew across a 2.5 m half-width is
-  // a ~46 degree chevron: steep enough to read as a direction at a glance,
+  // dash boundary into an arrowhead. 1.5 m of skew across a 1.4 m half-width is
+  // a ~47 degree chevron: steep enough to read as a direction at a glance,
   // shallow enough that it does not collapse into a zigzag when the ribbon is
   // seen nearly edge-on down a straight.
-  float s  = (vDist + a * 2.6) - uTime * uScroll;
+  float s  = (vDist + a * 1.5) - uTime * uScroll;
   float ph = fract(s / uPitch);
   // AA width taken from the CONTINUOUS coordinate: fwidth(fract(x)) spikes to 1
   // on the wrap and would put a grey band across every chevron.
-  float w  = clamp(fwidth(s) / uPitch, 0.0008, 0.3);
-  // Dash occupies 44% of the pitch. Hard step with exactly one pixel of AA.
-  float chev = smoothstep(0.44 + w, 0.44 - w, ph);
+  float w  = clamp(fwidth(s) / uPitch, 0.0006, 0.3);
+  // Dash occupies 34% of the pitch — smaller and crisper than the old 44%, so
+  // the arrows punctuate the fill instead of being the fill.
+  //
+  // Written as 1 - smoothstep(lo, hi, x) and NOT as smoothstep(hi, lo, x):
+  // GLSL leaves smoothstep undefined when edge0 >= edge1, and on the software
+  // rasteriser we capture frames with it silently sorts the edges, which
+  // INVERTS the dash. The old code had the reversed form and the arrowheads
+  // were coming out as the 66% gap rather than the 34% mark.
+  float chev = 1.0 - smoothstep(0.34 - w, 0.34 + w, ph);
 
-  // ---- edge rails ---------------------------------------------------------
-  float aw   = clamp(fwidth(a) * 1.2, 0.002, 0.4);
-  float rail = smoothstep(0.80 - aw, 0.80 + aw, a);
-  float core = 1.0 - rail;
-  // Kill the outermost sliver so the rail has a clean cut rather than an
-  // aliased staircase where the strip is almost parallel to the view ray.
-  float edge = 1.0 - smoothstep(0.985 - aw, 1.0, a);
+  // The arrowheads are INSET: they stop at 58% of the half-width, well short of
+  // the rails, so a continuous band of the darker fill runs between mark and
+  // rail. Without the inset the marks fuse with the rails into one connected
+  // pale web and the strip reads as a segmented caterpillar rather than as a
+  // lane with markings painted down the middle of it.
+  float mark = chev * (1.0 - smoothstep(0.58, 0.58 + max(aw, 0.035), a));
 
   // ---- wave-face glint, quantised ----------------------------------------
   // vTilt is 1 - N.y, i.e. how steeply the water is leaning here. Two hard
-  // steps, never a falloff: the ribbon flares as it climbs a swell face.
-  float glint = step(0.10, vTilt) * 0.12 + step(0.24, vTilt) * 0.16;
+  // steps, never a falloff: the ribbon flares as it climbs a swell face. Kept
+  // to the colour channel only now — pushing alpha as well used to shove the
+  // strip past 1 and produce lighter wedges wherever the lap crosses itself.
+  float glint = step(0.11, vTilt) * 0.5 + step(0.26, vTilt) * 0.5;
 
-  // Clamped: the rail plus a full glint would push past 1 and over-blend.
-  float alpha = min(1.0, max(rail * 0.88, core * (0.17 + chev * 0.62)) + glint);
-  alpha *= edge;
+  // ---- opacity ------------------------------------------------------------
+  // Rails 0.98, fill 0.88, chevrons lift the fill to 0.96. Nothing here drops
+  // low enough for the water bands to read through, which is the entire point.
+  // The last 2-12% is not an accident: leaving a sliver of the sea in means
+  // spray and crest foam still tint the strip where they cross it, so it stays
+  // part of the water instead of becoming a decal floating above it.
+  float alpha = mix(0.88 + mark * 0.08, 0.98, rail) * edge;
 
-  vec3 col = mix(uLine, uHot, clamp(chev * core * 0.85 + rail * 0.30 + glint, 0.0, 1.0));
+  // ---- colour -------------------------------------------------------------
+  // Value ladder, darkest to brightest: fill < rail < chevron. The rails stay
+  // BELOW foam white on purpose — the ribbon was the highest-value object in
+  // the frame and was out-shouting the spray.
+  vec3 col = uFill;
+  col = mix(col, uLine, mark * core);          // chevron arrowheads inside the lane
+  col = mix(col, uLine, rail);                 // rails
+  col = mix(col, uHot, rail * (0.20 + glint * 0.16) + mark * core * 0.26);
 
   // ---- distance fade, in four hard steps ---------------------------------
   // A continuous fade would put a soft grey smear along the horizon; stepping
@@ -603,6 +762,87 @@ void main() {
   f = floor(f * 4.0 + 0.5) / 4.0;
   alpha *= 1.0 - f;
 
+  if (alpha < 0.004) discard;
+  gl_FragColor = vec4(col, alpha);
+}
+`;
+
+// ---------------------------------------------------------------------------
+//  The start/finish line.
+//
+//  The critic's note was fair: the start gate hung over completely blank water.
+//  A start line is what tells you where the lap actually begins, and it is also
+//  the only hard black-and-white in the whole scene, so it anchors the
+//  countdown shot. Same surface solve as the ribbon — it is painted onto the
+//  swell, not floated over it.
+// ---------------------------------------------------------------------------
+
+/** Lateral size of one chequer cell, metres. */
+const START_CELL = 2.4;
+/** Along-track depth of one row. Two rows, so the band is 3.2 m deep. */
+const START_ROW = 1.6;
+
+const STARTLINE_VERT = /* glsl */ `
+attribute float aFlag;   // 0 or 1 — which chequer colour this face is
+
+uniform float uTime;
+
+varying float vFlag;
+varying float vDepth;
+varying float vTilt;
+
+${GERSTNER_GLSL}
+
+vec3 solveSurface(vec2 wp, float t, out vec3 nrm) {
+  vec2 s = wp;
+  vec3 pos;
+  for (int i = 0; i < 3; i++) {
+    gerstnerSurface(s, t, pos, nrm);
+    s += wp - pos.xz;
+  }
+  gerstnerSurface(s, t, pos, nrm);
+  return pos;
+}
+
+void main() {
+  vec3 base = (modelMatrix * vec4(position, 1.0)).xyz;
+  vec3 nrm;
+  vec3 surf = solveSurface(base.xz, uTime, nrm);
+  float dist = max(1.0, -(viewMatrix * vec4(surf, 1.0)).z);
+  // 0.11 m, i.e. 0.02 m UNDER the ribbon's lift, so the racing line draws over
+  // the chequer instead of z-fighting it where the two cross.
+  surf += nrm * (0.11 + dist * 0.0030);
+  vFlag  = aFlag;
+  vTilt  = 1.0 - nrm.y;
+  vec4 mv = viewMatrix * vec4(surf, 1.0);
+  vDepth = -mv.z;
+  gl_Position = projectionMatrix * mv;
+}
+`;
+
+const STARTLINE_FRAG = /* glsl */ `
+precision highp float;
+
+uniform vec3  uLight;
+uniform vec3  uDark;
+uniform float uFadeNear;
+uniform float uFadeFar;
+
+varying float vFlag;
+varying float vDepth;
+varying float vTilt;
+
+void main() {
+  // vFlag is constant across a face (all three vertices of every triangle carry
+  // the same value), so this is a hard chequer with no interpolation at all —
+  // the cell edges are the geometry's own edges.
+  vec3 col = mix(uLight, uDark, step(0.5, vFlag));
+  // One quantised step of shading off the wave face, so the band bends over the
+  // swell instead of reading as a decal.
+  col *= 1.0 - step(0.13, vTilt) * 0.14;
+  float f = clamp((vDepth - uFadeNear) / max(1.0, uFadeFar - uFadeNear), 0.0, 1.0);
+  f = floor(f * 4.0 + 0.5) / 4.0;
+  float alpha = 0.94 * (1.0 - f);
   if (alpha < 0.004) discard;
   gl_FragColor = vec4(col, alpha);
 }
@@ -651,11 +891,16 @@ export class Course {
     uHalfWidth: { value: number };
     uLine: { value: Color };
     uHot: { value: Color };
+    uFill: { value: Color };
     uPitch: { value: number };
     uScroll: { value: number };
+    uRail: { value: number };
     uFadeNear: { value: number };
     uFadeFar: { value: number };
   };
+
+  private readonly _startLine: Mesh;
+  private readonly _startUniforms: { uTime: { value: number } };
 
   private readonly _buoys: InstancedMesh;
   private readonly _buoyInk: InstancedMesh;
@@ -690,12 +935,19 @@ export class Course {
       uHalfWidth: { value: RIBBON_HALF_WIDTH },
       uLine: { value: PAL.line.clone() },
       uHot: { value: PAL.lineHot.clone() },
+      // Not a new hue — PAL.line at 55% value. The lane fill has to sit BELOW
+      // the rails or the whole strip reads as one flat slab again, and it has
+      // to be opaque or the water bands show through and we are back to
+      // cellophane. A shade of the existing green is the only way to get a
+      // value ladder inside a two-colour object.
+      uFill: { value: PAL.line.clone().multiplyScalar(0.46) },
       uPitch: { value: pitch },
       // The chevrons must always run AHEAD of you or they stop reading as a
       // direction and start reading as scenery going past. 34 m/s is above the
       // boats' realistic average on this sea, so they lead almost everywhere
       // and only get caught on a full-boost run down the main straight.
       uScroll: { value: 34 },
+      uRail: { value: RIBBON_RAIL },
       uFadeNear: { value: 540 },
       uFadeFar: { value: 1500 },
     };
@@ -704,6 +956,11 @@ export class Course {
 
     // ---- gates -----------------------------------------------------------
     this.buildGates();
+
+    // ---- start/finish line -------------------------------------------------
+    this._startUniforms = { uTime: { value: 0 } };
+    this._startLine = this.buildStartLine();
+    this.object.add(this._startLine);
 
     // ---- buoys -----------------------------------------------------------
     const spots = this.planBuoys();
@@ -884,12 +1141,12 @@ export class Course {
       fragmentShader: RIBBON_FRAG,
       transparent: true,
       depthWrite: false,
-      // Depth-tested (so boats and crests occlude it properly) but nudged
-      // toward the camera, because at 800 m the 0.15 m lift is inside one
-      // depth increment and the ribbon would z-fight with the water.
-      polygonOffset: true,
-      polygonOffsetFactor: -3,
-      polygonOffsetUnits: -6,
+      // NO POLYGON OFFSET. See the note in RIBBON_VERT: a slope-scaled offset on
+      // a strip lying flat on the sea, viewed from a metre above it, is
+      // effectively unbounded, and it was lifting the ribbon in front of the
+      // player's hull and spawning detached shards near the far gates. The
+      // distance-proportional world-space lift in the vertex shader does the
+      // same job with a magnitude we can actually reason about.
     });
 
     const mesh = new Mesh(geo, mat);
@@ -902,6 +1159,91 @@ export class Course {
     // rails already give it a drawn boundary.
     mesh.userData.noPrepass = true;
     mesh.frustumCulled = true;
+    return mesh;
+  }
+
+  /**
+   * Two rows of chequers laid across the track at u = 0, exactly as wide as the
+   * start gate so the two read as one piece of furniture.
+   *
+   * Each cell is its own pair of triangles carrying a constant `aFlag`, so the
+   * chequer is hard-edged by construction — no texture, no fract() pattern, no
+   * moire when the band is seen nearly edge-on down the straight.
+   */
+  private buildStartLine(): Mesh {
+    const width = this.gateWidthAt(0);
+    const halfW = width * 0.5;
+    const cols = Math.max(4, Math.round(width / START_CELL));
+    const cell = width / cols;
+
+    this.sampleFlat(0, _v);
+    this.tangent(0, _tan);
+    const ox = _v.x;
+    const oz = _v.z;
+    const tx = _tan.x;
+    const tz = _tan.z;
+    const lx = _tan.z; // left = up x tangent, same convention as everywhere else
+    const lz = -_tan.x;
+
+    const verts = cols * 2 * 6;
+    const pos = new Float32Array(verts * 3);
+    const flag = new Float32Array(verts);
+    let o = 0;
+    let fo = 0;
+    const put = (lat: number, along: number, f: number) => {
+      pos[o] = ox + lx * lat + tx * along;
+      pos[o + 1] = 0;
+      pos[o + 2] = oz + lz * lat + tz * along;
+      o += 3;
+      flag[fo++] = f;
+    };
+    for (let j = 0; j < cols; j++) {
+      for (let r = 0; r < 2; r++) {
+        const f = (j + r) % 2;
+        const l0 = -halfW + j * cell;
+        const l1 = l0 + cell;
+        // Centre the band ON the line rather than behind it: the checkpoint
+        // plane is at along = 0, so the chequer straddles it.
+        const a0 = -START_ROW + r * START_ROW;
+        const a1 = a0 + START_ROW;
+        put(l0, a0, f); put(l1, a0, f); put(l1, a1, f);
+        put(l0, a0, f); put(l1, a1, f); put(l0, a1, f);
+      }
+    }
+
+    const geo = new BufferGeometry();
+    geo.setAttribute('position', new BufferAttribute(pos, 3));
+    geo.setAttribute('aFlag', new BufferAttribute(flag, 1));
+    geo.computeBoundingSphere();
+    if (geo.boundingSphere) geo.boundingSphere.radius += WAVE_MAX_HEIGHT + 2;
+
+    const mat = new ShaderMaterial({
+      uniforms: {
+        uTime: this._startUniforms.uTime,
+        uLight: { value: PAL.foam.clone() },
+        uDark: { value: PAL.ink.clone() },
+        uFadeNear: { value: 320 },
+        uFadeFar: { value: 900 },
+      },
+      vertexShader: STARTLINE_VERT,
+      fragmentShader: STARTLINE_FRAG,
+      transparent: true,
+      depthWrite: false,
+      // DoubleSide, and not for style: the quads above are wound (left, then
+      // forward), and left x forward = -up, so their geometric normal points at
+      // the seabed. Front-face culling hid the whole band on the first attempt.
+      // The shader does not use `normal` at all, so drawing both faces is free
+      // and it also means the line is still there if the camera ever dips under
+      // the surface in a trough.
+      side: DoubleSide,
+    });
+
+    const mesh = new Mesh(geo, mat);
+    mesh.name = 'start_line';
+    mesh.renderOrder = 2; // under the ribbon (3), over the ocean
+    // Same reasoning as the ribbon: this is paint on the water, and seeding the
+    // prepass would have the Sobel pass ink every single chequer cell.
+    mesh.userData.noPrepass = true;
     return mesh;
   }
 
@@ -940,17 +1282,23 @@ export class Course {
         color2: PAL.foam,
         emissive: PAL.gateLit,
         emissiveStrength: 0,
-        rim: 0.6,
-        rimPower: 2.4,
-        specSize: 0.3,
-        specStrength: 0.4,
-        matcapStrength: 0.14,
-        gradient: 0.12,
+        rim: 0.45,
+        rimPower: 2.6,
+        // The banner used to carry a soft white specular sweep down its whole
+        // length plus a vertical gradient — a gloss highlight, i.e. the one
+        // thing an NPR flat fill must not have. Spec is now a small hard chip
+        // and the gradient is off, so the banner is a flat orange plane with
+        // hard stripes and an ink edge.
+        specSize: 0.2,
+        specStrength: 0.16,
+        matcapStrength: 0.05,
+        gradient: 0,
+        fragExtra: GATE_FRAG_EXTRA,
       });
 
       const mesh = new Mesh(geo, material);
       mesh.name = `gate_${i}`;
-      addOutline(mesh, { widthPx: 2.8 });
+      addOutline(mesh, { widthPx: 2.6 });
 
       const group = new Object3D();
       group.add(mesh);
@@ -1191,6 +1539,7 @@ export class Course {
   update(dt: number, t: number, camera: PerspectiveCamera): void {
     this._t = t;
     this._ribbonUniforms.uTime.value = t;
+    this._startUniforms.uTime.value = t;
     this.bob(dt, camera);
   }
 
@@ -1226,13 +1575,27 @@ export class Course {
       const pz = gate.position.z;
       const hL = sampleHeight(px + info.lx * hw, pz + info.lz * hw, t);
       const hR = sampleHeight(px - info.lx * hw, pz - info.lz * hw, t);
-      const hF = sampleHeight(px + info.tx * 5, pz + info.tz * 5, t);
+      // Fore/aft pair, CENTRED on the gate and taken over a long arm.
+      //
+      // This used to be a single sample 5 m ahead differenced against the gate's
+      // own height, and 5 m is shorter than the wavelength of anything in the
+      // swell — on a steep face it produced 25-30 degrees of pitch and the far
+      // gates read as tilted, half-sunk wreckage. GATE_ARM is 14 m so the
+      // difference is taken across a real fraction of a wave, and it is a
+      // central difference so the slope is the slope AT the gate rather than
+      // the slope of the chord to a point in front of it.
+      const hF = sampleHeight(px + info.tx * GATE_ARM, pz + info.tz * GATE_ARM, t);
+      const hB = sampleHeight(px - info.tx * GATE_ARM, pz - info.tz * GATE_ARM, t);
 
       const y = (hL + hR) * 0.5;
       // Roll about the local +Z (the tangent): left pylon high => lean left.
-      const roll = Math.atan2(hL - hR, hw * 2);
+      // Both axes are damped: this is a rigid structure on two moorings tens of
+      // metres apart, and a mooring resists the slope it is sitting in. A gate
+      // that lies flat along the wave face reads as debris, exactly like a buoy
+      // that does (see the 0.7 factor on the buoy normals below).
+      const roll = Math.atan2(hL - hR, hw * 2) * GATE_TILT_DAMP;
       // Pitch about the local +X: nose (forward) high => pitch up.
-      const pitch = Math.atan2(hF - y, 5);
+      const pitch = Math.atan2((hF - hB) * 0.5, GATE_ARM) * GATE_TILT_DAMP;
 
       gate.position.y = y;
       gate.object.position.set(px, y, pz);
@@ -1295,6 +1658,8 @@ export class Course {
   dispose(): void {
     this._ribbon.geometry.dispose();
     (this._ribbon.material as ShaderMaterial).dispose();
+    this._startLine.geometry.dispose();
+    (this._startLine.material as ShaderMaterial).dispose();
     for (const g of this._gateInfo) g.material.dispose();
     for (const gate of this.gates) {
       gate.object.traverse((o) => {
