@@ -133,8 +133,10 @@ const SHOTS = [
   },
 ];
 
+const PORT = arg('port', '5199');
+
 async function startServer() {
-  const server = spawn('npx', ['vite', '--port', '5199', '--strictPort'], {
+  const server = spawn('npx', ['vite', '--port', PORT, '--strictPort'], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -152,7 +154,7 @@ const main = async () => {
   let url = arg('url', null);
   if (!url) {
     server = await startServer();
-    url = 'http://localhost:5199/';
+    url = `http://localhost:${PORT}/`;
   }
 
   mkdirSync(OUT, { recursive: true });

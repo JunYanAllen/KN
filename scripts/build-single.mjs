@@ -17,7 +17,14 @@ if (!existsSync(DIST)) {
   process.exit(1);
 }
 
-const files = readdirSync(path.join(DIST, 'assets')).map((f) => path.join(DIST, 'assets', f));
+// Vite is configured to emit a single `game.js` at the dist root, but stay
+// tolerant of an assets/ layout so this keeps working if that config changes.
+const dirs = [DIST, path.join(DIST, 'assets')].filter((d) => existsSync(d));
+const files = dirs.flatMap((d) =>
+  readdirSync(d)
+    .map((f) => path.join(d, f))
+    .filter((f) => f.endsWith('.js') || f.endsWith('.css'))
+);
 const jsFile = files.find((f) => f.endsWith('.js'));
 const cssFile = files.find((f) => f.endsWith('.css'));
 if (!jsFile) {
