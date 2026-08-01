@@ -136,7 +136,11 @@ const main = async () => {
 
   mkdirSync(OUT, { recursive: true });
 
+  // Use whatever Chromium the environment already has; falling back to
+  // Playwright's own download would need the network and we do not use it.
+  const localChromium = '/opt/pw-browsers/chromium';
   const browser = await chromium.launch({
+    executablePath: existsSync(localChromium) ? localChromium : undefined,
     args: [
       '--use-gl=angle',
       '--use-angle=swiftshader',
