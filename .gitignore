@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dist-single/
+dist-artifact/
+shots/
+.DS_Store
+*.log
+.vite/
