@@ -282,13 +282,36 @@ const hudMount = document.getElementById('hud')!;
 const game = new Game(app, hudMount);
 game.loop();
 
-const resumeAudio = () => {
+/**
+ * Title card. The race runs behind it as an attract shot — the cinematic orbit
+ * over live water is a better title screen than any static image, and it costs
+ * nothing because the game is already rendering.
+ *
+ * It also gives us the user gesture the Web Audio context needs; a browser will
+ * not let us synthesise a note before someone has clicked something.
+ */
+const gate = document.getElementById('gate');
+const startBtn = document.getElementById('start') as HTMLButtonElement | null;
+
+const beginRace = () => {
+  if (gate) gate.hidden = true;
   game.audio.resume();
-  window.removeEventListener('pointerdown', resumeAudio);
-  window.removeEventListener('keydown', resumeAudio);
+  game.restart();
+  game.engine.domElement.focus();
 };
-window.addEventListener('pointerdown', resumeAudio);
-window.addEventListener('keydown', resumeAudio);
+
+if (startBtn) {
+  startBtn.disabled = false;
+  startBtn.textContent = 'Start race';
+  startBtn.addEventListener('click', beginRace);
+}
+// Any key also drops you in, so a keyboard player never has to reach for a mouse.
+window.addEventListener('keydown', function once(e) {
+  if (gate?.hidden) return;
+  if (e.code === 'Tab') return; // let people tab to the button
+  window.removeEventListener('keydown', once);
+  beginRace();
+});
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyR') game.restart();

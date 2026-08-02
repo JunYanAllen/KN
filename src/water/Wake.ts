@@ -177,6 +177,36 @@ const SPRAY_DRAG = 2.4;
 /** Depth-sort buckets. 128 over 150 m = 1.2 m granularity, finer than a sprite. */
 const SORT_BUCKETS = 128;
 
+/**
+ * ---- SIZE CLASSES ---------------------------------------------------------
+ *
+ * Round 3 drew one unimodal size distribution — a base times a mildly skewed
+ * scatter — and every particle landed within a factor of about three of every
+ * other one. On screen that is the signature of manufactured confetti: a real
+ * spray mass is overwhelmingly fine droplets, has a THIN population of mid
+ * chips, and carries a handful of big torn sheets that do all the drawing.
+ *
+ * So the draw is now explicitly three-modal, with GAPS between the bands. The
+ * gaps are the important part — overlapping bands blur back into one continuum
+ * of mid sizes, which is precisely the band that reads as paper scraps. The mid
+ * band is also the least populated of the three on purpose.
+ *
+ * The class is carried through to the shader, where it selects the SHAPE
+ * TREATMENT (compact bead / scrap / elongated combed sheet) rather than just a
+ * scale. One glyph at graded sizes still reads as one kind of object.
+ */
+const FORM_DROPLET = 0;
+const FORM_CHIP = 1;
+const FORM_SHEET = 2;
+/**
+ * Cumulative class probabilities: 74 % droplet, 19 % chip, 7 % sheet. The chip
+ * band is squeezed deliberately — mid-size is the band that reads as confetti,
+ * and the contrast between a lot of fines and a few big sheets is what makes
+ * the mass read as one thing rather than as a population of objects.
+ */
+const P_DROPLET = 0.74;
+const P_CHIP = 0.93;
+
 // ---------------------------------------------------------------------------
 //  Module-scope scratch. Nothing in this file allocates inside a frame.
 // ---------------------------------------------------------------------------
@@ -363,15 +393,19 @@ void main() {
 
 const SPRAY_VERT = /* glsl */ `
 attribute vec3 iPos;
-attribute vec4 iData;   // x age01, y size (metres), z seed, w aspect bias
+attribute vec4 iData;   // x age01, y size (metres), z seed, w packed form+aspect
 attribute vec3 iVel;    // world velocity — this is what points the flick
+
+uniform vec3 uSunDir;   // world direction TO the sun, normalised
 
 varying vec2  vP;       // local sprite space, -1..1, +y = direction of travel
 varying vec2  vDown;    // screen-down resolved into vP space, unit length
+varying vec2  vLit;     // direction TO the sun resolved into vP space, unit length
 varying float vAge;
 varying float vSeed;
 varying float vDepth;
 varying float vInk;
+varying float vForm;    // 0 droplet, 1 chip, 2 torn sheet
 
 float h11v(float x) { return fract(sin(x * 127.13) * 43758.5453); }
 
@@ -379,6 +413,14 @@ void main() {
   vAge = iData.x;
   vSeed = iData.z;
   float s = iData.y;
+
+  // iData.w packs two per-particle constants into one float rather than paying
+  // for a fourth instanced attribute: the integer part is the size class and
+  // the fraction is the aspect bias scaled by 1/4 (aspect is 0.8..1.5, so a
+  // quarter of it can never carry into the integer part).
+  float form = floor(iData.w);
+  float aspect = fract(iData.w) * 4.0;
+  vForm = form;
 
   // Screen-aligned billboard taken from the view matrix rows. Screen-aligned
   // rather than view-plane-aligned on purpose: the ink line below has to sit on
@@ -405,12 +447,24 @@ void main() {
   float sj = sin(jit);
   dir = vec2(dir.x * cj - dir.y * sj, dir.x * sj + dir.y * cj);
 
-  // Stretch along travel. 0.035/(m/s) puts a 20 m/s droplet at 1.7x and the cap
-  // at 2.3 stops a boosted one turning into a laser. The 1/sqrt on the cross
-  // axis holds the painted area roughly constant so fast spray thins rather
-  // than growing, and iData.w scatters the aspect so the flicks are not clones.
-  float stretch = clamp((1.0 + length(iVel) * 0.035) * iData.w, 0.85, 2.3);
-  float xs = 0.86 / sqrt(stretch);
+  // Stretch along travel. 0.035/(m/s) puts a 20 m/s droplet at 1.7x, and the
+  // aspect bias scatters it so the flicks are not clones. The 1/sqrt on the
+  // cross axis holds the painted area roughly constant so fast spray thins
+  // rather than growing.
+  //
+  // The class multiplier is the whole point of having classes: a droplet is a
+  // compact blob whatever its velocity (0.75 pushes it against the lower clamp
+  // and it stays near-square), a sheet is a genuinely elongated ribbon of water
+  // (1.75, cap raised to 3.2). Scaling ONE shape up and down — which is what
+  // round 3 did — gives big and small copies of the same glyph, and a field of
+  // one glyph at graded sizes is exactly what reads as cut paper.
+  float formStretch = form > 1.5 ? 1.40 : (form > 0.5 ? 1.0 : 0.75);
+  float stretch = clamp((1.0 + length(iVel) * 0.035) * aspect * formStretch, 0.85, 2.7);
+  // Cross-axis exponent. A sheet is a BROAD flat plate of water seen at an
+  // angle, not a needle: at the sqrt the fast ones came out 5:1 and rendered as
+  // scratches on the frame. 0.34 holds a sheet nearer 3.5:1, wide enough that
+  // the torn end below has something to be torn across.
+  float xs = 0.86 / pow(stretch, form > 1.5 ? 0.34 : 0.5);
 
   vec2 lp = position.xy * 2.0;   // quad is +/-0.5 -> local -1..1
   vP = lp;
@@ -425,17 +479,30 @@ void main() {
   vec2 dl = vec2(dir.x / xs, -dir.y / stretch);
   vDown = normalize(dl + vec2(1e-6, 0.0));
 
+  // The sun, resolved into the same unscaled vP frame, is what the fragment
+  // shader splits the shape along. It has to be done here and not per fragment
+  // because it depends on the sprite's own orientation and anisotropic scale.
+  // Doing it in world space per particle and shading in screen space would put
+  // the terminator in a different place on every sprite; resolving the single
+  // world sun direction into each sprite's frame is what makes the whole mass
+  // agree about where the light is coming from.
+  vec2 ss = vec2(dot(uSunDir, right), dot(uSunDir, up));
+  vec2 sl = vec2(dot(ss, ex) / xs, dot(ss, dir) / stretch);
+  // Looking straight down the sun (|sl| ~ 0) leaves the split direction
+  // undefined; fall back to screen-up so the shade lands underneath.
+  vLit = dot(sl, sl) > 1e-6 ? normalize(sl) : -vDown;
+
   vec3 wp = iPos + right * scr.x + up * scr.y;
   vec4 mv = viewMatrix * vec4(wp, 1.0);
   vDepth = -mv.z;
 
   // Ink gate. A 15 px flick with a drawn line all round it is a bubble; ink is
   // only affordable on the sprites big and near enough to read as a brush
-  // stroke, which is deliberately a small minority of any burst — that handful
-  // of accented shapes is what gives the mass a hierarchy instead of a texture.
-  // The size range tops out around 0.75 m, so 0.34..0.62 lets roughly the
-  // largest sixth of a burst carry a line and leaves the rest bare.
-  vInk = smoothstep(0.34, 0.62, s) * (1.0 - smoothstep(26.0, 65.0, vDepth));
+  // stroke. Gated on the CLASS rather than on the metre size: size shrinks over
+  // a particle's life, so a size gate made a sheet quietly lose its drawn edge
+  // halfway through its flight, and a large chip thrown by a hard landing
+  // picked one up. Only sheets are ever inked, and they are 7 % of a burst.
+  vInk = step(1.5, form) * (1.0 - smoothstep(30.0, 70.0, vDepth));
 
   gl_Position = projectionMatrix * mv;
 }
@@ -446,6 +513,7 @@ precision highp float;
 
 uniform vec3  uFoam;
 uniform vec3  uFoamShade;
+uniform vec3  uFoamDeep;
 uniform vec3  uInk;
 uniform vec3  uSunColor;
 uniform vec3  uFogColor;
@@ -454,10 +522,12 @@ uniform float uFogFar;
 
 varying vec2  vP;
 varying vec2  vDown;
+varying vec2  vLit;
 varying float vAge;
 varying float vSeed;
 varying float vDepth;
 varying float vInk;
+varying float vForm;
 
 /**
  * Trig-free hash (Hoskins' hash11). It only has to decorrelate a handful of
@@ -492,12 +562,22 @@ const float S72 = 0.951057;
  *
  * The sprite is oriented with +y along travel, so the -y half is additionally
  * pinched into a tail and the whole thing reads as a flick, not a pebble.
+ *
+ * The form argument selects the TREATMENT, not the scale: a droplet is a faceted
+ * bead with almost no tail, a chip is the general-purpose scrap, and a sheet is
+ * combed off raggedly across its trailing end so that — stretched along travel
+ * by the vertex shader — it reads as a torn sheet of water rather than as a
+ * large chip. Water at these speeds does not come apart into similar pieces.
  */
-float sprayField(vec2 p, float seed) {
+float sprayField(vec2 p, float seed, float form) {
   // Per-particle tail. At 0.25 it is a chunky scrap, at 1.2 a thin comma; a
   // fixed value makes every sprite the same glyph and a field of identical
-  // glyphs tiles like fish scales instead of reading as spray.
-  float pinch = 0.25 + 0.95 * hs(seed + 4.0);
+  // glyphs tiles like fish scales instead of reading as spray. Droplets get
+  // almost none of it (surface tension pulls a small droplet round) and sheets
+  // get a moderate amount, because their tail is drawn by the comb below.
+  float pinch = form > 1.5 ? (0.15 + 0.32 * hs(seed + 4.0))
+              : form > 0.5 ? (0.25 + 0.95 * hs(seed + 4.0))
+                           : (0.05 + 0.28 * hs(seed + 4.0));
   float k = clamp(-p.y, 0.0, 1.0);
   vec2 q = vec2(p.x * (1.0 + pinch * k * k), p.y);
 
@@ -526,12 +606,40 @@ float sprayField(vec2 p, float seed) {
     float rb = 0.40 + 0.45 * hs(seed + 33.0 + fj * 3.0);
     d = min(d, length(q - bo * (0.72 + rb * 0.8)) - rb);
   }
+
+  // Ragged trailing edge, sheets only. A row of straight-sided teeth cut across
+  // the -y end: floor() gives genuinely hard notches, whereas any smooth wave
+  // rounds the tail straight back off into a lobe. Each tooth is an independent
+  // half-plane, so the field stays distance-like inside every tooth and the
+  // fwidth() edge below is still one pixel; the only discontinuities are the
+  // vertical walls BETWEEN teeth, which is exactly where a tear should be sharp.
+  if (form > 1.5) {
+    // A sheet is the only particle big enough on screen for its OUTLINE to be
+    // read shape-by-shape, and an irregular pentagon at 3:1 aspect reads as a
+    // rectangle — a playing card. So all four sides get torn independently.
+    float tx = 2.0 + 2.4 * hs(seed + 51.0);
+    float cx = floor(q.x * tx + hs(seed + 53.0) * 8.0);
+    // Trailing end: deep teeth, this is where the sheet is coming apart.
+    d = min(d, q.y + 0.98 - (0.10 + 0.62 * hs(cx * 3.17 + seed * 1.7 + 5.0)));
+    // Leading end: shallower. One clean end and one frayed end reads as a
+    // cleanly cut plank with a hem, which is worse than either.
+    d = min(d, 0.98 - (0.04 + 0.30 * hs(cx * 5.41 + seed * 2.3 + 19.0)) - q.y);
+
+    // Long edges, frayed independently left and right. This is what actually
+    // kills the card: the two long sides are the edges the eye measures, and
+    // once they step in and out over four or five cells the silhouette stops
+    // having a measurable width at all.
+    float ty = 1.8 + 2.6 * hs(seed + 61.0);
+    float cy = floor(q.y * ty + hs(seed + 63.0) * 8.0);
+    d = min(d, 0.92 - (0.06 + 0.46 * hs(cy * 2.71 + seed * 1.3 + 31.0)) - q.x);
+    d = min(d, q.x + 0.92 - (0.06 + 0.46 * hs(cy * 4.13 + seed * 1.9 + 41.0)));
+  }
   return d;
 }
 
 void main() {
   vec2 p = vP;
-  float d = sprayField(p, vSeed);   // signed: > 0 inside
+  float d = sprayField(p, vSeed, vForm);   // signed: > 0 inside
 
   // One pixel of coverage either side of the boundary. The field is distance-
   // like so fwidth is bounded and the clamp almost never bites; the upper end
@@ -545,24 +653,57 @@ void main() {
   // How far toward the screen-down side of the shape this pixel sits.
   float low = dot(p, vDown);
 
-  // Two flat tones, hard split. The shade tone is a wedge along the UNDERSIDE
-  // only — never a ring, because a ring is what turned every round-2 sprite
-  // into a soap bubble. (low - d*1.6) is positive only near the lower edge: at
-  // the bottom edge low is large and d ~ 0, at the centre low ~ 0 and d is
-  // large, at the top edge low is negative.
+  // ---- THREE FLAT TONES, SPLIT ALONG THE SUN --------------------------------
   //
-  // The threshold is per-particle so the wedge is a sliver on some sprites and
-  // a third of the shape on others; holding it fixed stamps the same crescent
-  // on all of them and the mass turns back into a texture.
-  float shThr = 0.02 + 0.30 * hs(vSeed + 8.0);
-  float shade = step(shThr, low - d * 1.6);
+  // Round 3 shaded with a wedge hugging the screen-down EDGE — step(thr,
+  // low - d*1.6). Because d is 0.4..0.9 through the whole interior of the
+  // shape, that expression only goes positive within a hair of the boundary, so
+  // what actually rendered was a full-strength flat white fill with an
+  // occasional pale sliver at the bottom. Flat white with no interior tone is
+  // the entire reason the particles read as paper: a cel shape becomes a volume
+  // the moment it carries a lit face AND a shaded face, and it stays a cutout
+  // until it does.
+  //
+  // So the split is now a straight terminator through the BODY of the shape,
+  // perpendicular to the sun direction resolved into sprite space. It is the
+  // same sun every other surface in the frame is lit by, so a hundred sprites
+  // all turn their shaded faces the same way and the mass reads as one lump of
+  // water catching the light rather than as a hundred unrelated chips.
+  float lit = dot(p, vLit);
+
+  // Antialias the terminator over one pixel and no more. Quantised, not soft:
+  // this is a cel edge, it just must not stipple on a sprite ten pixels across.
+  float lw = max(fwidth(lit) * 0.7, 1e-4);
+
+  // Per-particle terminator offset. Fixed, it stamps the identical crescent on
+  // every sprite and the mass turns back into a repeating texture; the range is
+  // biased so the shaded face runs from about a quarter to about half of the
+  // shape — the sun here is high and near-white, so a shape more than half in
+  // shadow reads as dirty rather than as lit water.
+  float shThr = -0.30 + 0.44 * hs(vSeed + 8.0);
+  float shade = 1.0 - smoothstep(shThr - lw, shThr + lw, lit);
+  // Third tone: the core shadow that clings to the away-from-sun edge. Two
+  // tones make a volume, the third makes it a volume with a thickness — and on
+  // the big sheets it is what stops the shaded half itself reading as flat.
+  float deepThr = shThr - 0.30 - 0.28 * hs(vSeed + 12.0);
+  float deep = 1.0 - smoothstep(deepThr - lw, deepThr + lw, lit);
+
   vec3 col = mix(uFoam, uFoamShade, shade);
+  col = mix(col, uFoamDeep, deep);
+  // Warm the lit face only. Tinting the shade too would collapse the tones back
+  // toward each other, which is the flat-white failure again by another route.
   col *= mix(vec3(1.0), uSunColor, 0.22 * (1.0 - shade));
 
-  // Ink, lower edge only, gated on size and distance by vInk. Thickness is in
+  // Ink, lower edge only, gated on class and distance by vInk. Thickness is in
   // local units so the line grows with the sprite the way a brush stroke does.
+  //
+  // Restricted to the part of the lower edge that is ALSO in the core shadow,
+  // and to two thirds strength. A continuous line all the way round the bottom
+  // of a big sheet reads as a keel and turns the sprite into a boat; a stroke
+  // that appears only where the shape is already dark reads as the accent a
+  // brush leaves where it lifts off.
   float ink = (1.0 - smoothstep(0.015, 0.05, d)) * smoothstep(0.10, 0.40, low);
-  col = mix(col, uInk, ink * vInk * 0.9);
+  col = mix(col, uInk, ink * vInk * deep * 0.65);
 
   // Quantised opacity: pop in over two frames, then step down in four levels.
   // Quantising the FADE and not the edge keeps the silhouette antialiased while
@@ -648,6 +789,8 @@ export class WakeSystem {
   private readonly pSeed = new Float32Array(MAX_PARTICLES);
   /** Per-particle multiplier on the velocity stretch, so flicks are not clones. */
   private readonly pAspect = new Float32Array(MAX_PARTICLES);
+  /** Size class, FORM_*. Drives both the spawn scale and the shader treatment. */
+  private readonly pForm = new Float32Array(MAX_PARTICLES);
   /** Cached water height under each particle; refreshed lazily, see update(). */
   private readonly pWater = new Float32Array(MAX_PARTICLES);
   private live = 0;
@@ -837,8 +980,14 @@ export class WakeSystem {
         // TOP of the foam ribbon as often as it is drawn on open water, and at
         // parity the sprites vanish into the ribbon and only their shade band
         // survives — which is what reduced the mass to a texture.
-        uFoamShade: { value: PAL.foamShade.clone().multiplyScalar(0.9) },
+        uFoamShade: { value: PAL.foamShade.clone().multiplyScalar(0.86) },
+        // Third tone. Not a new hue: PAL.waterCrest is the palette's existing
+        // step below foamShade (the colour the water itself takes just under
+        // the foam), so foam → foamShade → waterCrest is a ramp the rest of the
+        // frame already uses and the spray stays in the same colour family.
+        uFoamDeep: { value: PAL.waterCrest.clone().multiplyScalar(0.82) },
         uInk: { value: PAL.ink.clone() },
+        uSunDir: CEL_GLOBALS.uSunDir,
         uSunColor: CEL_GLOBALS.uSunColor,
         uFogColor: CEL_GLOBALS.uFogColor,
         uFogNear: CEL_GLOBALS.uFogNear,
@@ -977,6 +1126,12 @@ export class WakeSystem {
       const rad = rr * rr * 1.5;
       const rang = this.rnd() * Math.PI * 2;
 
+      // Base size is now nearly deterministic and the CLASS carries all of the
+      // variation. Keeping a wide random base as well would smear the three
+      // bands back into the single continuum this is fixing.
+      const form = this.pickForm();
+      const base = 0.25 + amt * 0.06;
+
       this.spawn(
         pos.x + Math.cos(rang) * rad,
         pos.y + this.rnd() * 0.45,
@@ -984,13 +1139,15 @@ export class WakeSystem {
         (ux + ax * sx + bx * sy) * speed,
         (uy + by * sy) * speed,
         (uz + az * sx + bz * sy) * speed,
-        0.34 + this.rnd() * 0.42 + amt * 0.14,
-        // 0.09..0.85 m, against round 2's 0.55..4.3 m — one sprite used to cover
-        // the hull that threw it. The square on the scatter term is deliberate:
-        // it makes most of the burst small and a handful noticeably large, so
-        // the mass has a hierarchy instead of being a field of equal grains.
-        (0.15 + this.rnd() * 0.24 + amt * 0.09) * (0.6 + 1.25 * sq(this.rnd())),
-        wh
+        // Sheets are heavy and hold together longer than a droplet does; giving
+        // them the same life as the fines meant the only large shapes in the
+        // frame were also the shortest-lived ones on screen.
+        (0.34 + this.rnd() * 0.42 + amt * 0.14) * (form === FORM_SHEET ? 1.3 : 1.0),
+        // 0.06..0.95 m across the three bands, most of the population under
+        // 0.15 m and roughly one in fourteen above 0.5 m.
+        base * this.formScale(form),
+        wh,
+        form
       );
     }
   }
@@ -1248,6 +1405,7 @@ export class WakeSystem {
           const bx = x - tx * along - tz * lat;
           const bz = z - tz * along + tx * lat;
           const wh = sampleHeight(bx, bz, t);
+          const form = this.pickForm();
           this.spawn(
             bx,
             wh + 0.1,
@@ -1264,12 +1422,13 @@ export class WakeSystem {
             // sheet spreads into a thin trail of separate chips. Halving the
             // life and tripling the rate puts the same water in a third of the
             // distance, which is the difference between a scatter and a mass.
-            0.22 + this.rnd() * 0.26 + speed01 * 0.16,
-            // Same heavy-tailed scatter as the burst: 0.08..0.95 m, most of it
-            // down at the bottom of that range. Even the top of it is a sixth
-            // of a hull length, against round 2's 1.55 m stern sprites.
-            (0.12 + this.rnd() * 0.18 + speed01 * 0.11) * (0.6 + 1.25 * sq(this.rnd())),
-            wh
+            (0.22 + this.rnd() * 0.26 + speed01 * 0.16) * (form === FORM_SHEET ? 1.3 : 1.0),
+            // Three separated bands off a near-fixed base: droplets 0.05..0.16,
+            // chips 0.18..0.33, sheets 0.44..1.00 m at top speed. Even the
+            // largest is a sixth of a hull length.
+            (0.22 + speed01 * 0.06) * this.formScale(form),
+            wh,
+            form
           );
         }
       } else {
@@ -1487,6 +1646,24 @@ export class WakeSystem {
   //  Spray
   // -------------------------------------------------------------------------
 
+  /** Draw a size class. See the FORM_* block at the top of the file. */
+  private pickForm(): number {
+    const r = this.rnd();
+    return r < P_DROPLET ? FORM_DROPLET : r < P_CHIP ? FORM_CHIP : FORM_SHEET;
+  }
+
+  /**
+   * Multiplier on the emitter's base size for a class. The bands do not touch:
+   * 0.24–0.58, 0.80–1.20, 1.70–3.00. A particle can therefore never sit in the
+   * dead zone between a droplet and a chip, which is where "all the same size"
+   * comes from.
+   */
+  private formScale(form: number): number {
+    if (form === FORM_DROPLET) return 0.24 + 0.34 * this.rnd();
+    if (form === FORM_CHIP) return 0.8 + 0.4 * this.rnd();
+    return 1.7 + 1.3 * this.rnd();
+  }
+
   private spawn(
     x: number,
     y: number,
@@ -1496,7 +1673,8 @@ export class WakeSystem {
     vz: number,
     life: number,
     size: number,
-    water: number
+    water: number,
+    form: number
   ) {
     let i: number;
     if (this.live < MAX_PARTICLES) {
@@ -1519,6 +1697,7 @@ export class WakeSystem {
     this.pSize[i] = size;
     this.pSeed[i] = this.rnd() * 64;
     this.pAspect[i] = 0.8 + this.rnd() * 0.7;
+    this.pForm[i] = form;
     this.pWater[i] = water;
   }
 
@@ -1615,6 +1794,7 @@ export class WakeSystem {
       this.pSize[i] = this.pSize[last];
       this.pSeed[i] = this.pSeed[last];
       this.pAspect[i] = this.pAspect[last];
+      this.pForm[i] = this.pForm[last];
       this.pWater[i] = this.pWater[last];
     }
   }
@@ -1681,7 +1861,9 @@ export class WakeSystem {
       D[s * 4 + 1] =
         this.pSize[i] * (0.45 + 0.55 * smooth01(a01, 0.0, 0.12)) * (1 - 0.78 * a01 * a01);
       D[s * 4 + 2] = this.pSeed[i];
-      D[s * 4 + 3] = this.pAspect[i];
+      // Pack: integer part = size class, fraction = aspect/4. pAspect is
+      // 0.8..1.5 so a quarter of it is 0.2..0.375 and can never carry.
+      D[s * 4 + 3] = this.pForm[i] + this.pAspect[i] * 0.25;
       V[s * 3] = this.vx[i];
       V[s * 3 + 1] = this.vy[i];
       V[s * 3 + 2] = this.vz[i];
@@ -1724,11 +1906,6 @@ export class WakeSystem {
     (this.sprayMesh.material as ShaderMaterial).dispose();
     this.sprayMesh.dispose();
   }
-}
-
-/** x², used to skew a uniform draw toward zero. */
-function sq(x: number): number {
-  return x * x;
 }
 
 /** Scalar smoothstep with GLSL semantics. */

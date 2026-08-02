@@ -40,14 +40,21 @@ const srcHtml = readFileSync(path.join(DIST, 'index.html'), 'utf8');
 const styleMatch = srcHtml.match(/<style>([\s\S]*?)<\/style>/);
 const pageCss = (styleMatch ? styleMatch[1] : '') + '\n' + css;
 
+// Everything between <body> and the module script: the canvas mounts and the
+// title card. Keeping one copy in index.html means the dev server and the
+// single-file build can never disagree about the shell.
+const bodyMatch = srcHtml.match(/<body>([\s\S]*?)<script/);
+const mounts = bodyMatch
+  ? bodyMatch[1].trim()
+  : '<div id="app"></div>\n<div id="hud"></div>';
+
 const TITLE = 'WAKE RUNNER — cel-shaded ocean racing';
 
 const body = `<title>${TITLE}</title>
 <style>
 ${pageCss}
 </style>
-<div id="app"></div>
-<div id="hud"></div>
+${mounts}
 <script type="module">
 ${js}
 </script>`;
@@ -66,8 +73,7 @@ ${pageCss}
 </style>
 </head>
 <body>
-<div id="app"></div>
-<div id="hud"></div>
+${mounts}
 <script type="module">
 ${js}
 </script>

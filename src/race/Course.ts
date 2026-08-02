@@ -204,12 +204,19 @@ const BUOY_NORMAL_SQ = 220 * 220;
  *  Gerstner component has a 9 m wavelength, so this is ~11 samples per wave)
  *  and costs 6242 vertices, i.e. nothing. */
 const RIBBON_SEGMENTS = 3120;
-/** 2.8 m overall. It was 5 m and at chase-camera height a 5 m strip laid on the
- *  sea covers something like 40% of the frame — it stops guiding the eye and
- *  starts carpeting the picture. 2.8 m is a little under one hull width, which
- *  is what a painted racing line should be: something you straddle, not
- *  something you drive along inside of. */
-const RIBBON_HALF_WIDTH = 1.4;
+/** 2.6 m overall, MEASURED not assumed: `aPerp` is built from an already
+ *  normalised tangent, so the edge-to-edge separation is exactly
+ *  2 * RIBBON_HALF_WIDTH at every one of the 3120 rings — verified numerically
+ *  as 2.600000 m min and max. The strip has never been the wide object the
+ *  round-3 frames make it look like; what made pack.png read as a grassy
+ *  hillside is that WAVE_MAX_HEIGHT is 5.06 m, so at t = 34 s the chase camera
+ *  was sitting a metre or two off the face of a crest with the ribbon painted
+ *  on it. A 2.6 m strip 1.5 m from the lens subtends the whole frame no matter
+ *  how narrow it nominally is. That is a COVERAGE problem, and it is fixed
+ *  below by the near-lens and low-camera fades, not by shrinking the ribbon
+ *  further — any narrower and it stops being legible at 200 m.
+ *  1.5 m is the hull beam, so this is a strip you straddle. */
+const RIBBON_HALF_WIDTH = 1.3;
 /** Where the bright outer rail starts, as a fraction of the half-width. At 0.74
  *  the rails were 0.36 m each and together they were 52% of the strip — more
  *  rail than lane, which is why the ribbon read as one bright slab. 0.83 gives
@@ -639,6 +646,7 @@ varying float vSide;
 varying float vDist;
 varying float vDepth;
 varying float vTilt;
+varying float vAbove;
 
 ${GERSTNER_GLSL}
 
@@ -686,6 +694,19 @@ void main() {
   vSide  = aSide;
   vDist  = aDist;
   vTilt  = 1.0 - nrm.y;
+
+  // HOW HIGH IS THE LENS ABOVE THIS BIT OF STRIP.
+  //
+  // dot(cameraPosition - surf, nrm) is the perpendicular distance from the eye
+  // to the ribbon's own tangent plane here, i.e. the eye height measured
+  // against the wave face the strip is lying on rather than against y = 0.
+  // That is the ONE number that predicts how much screen a flat strip is about
+  // to cover: screen area per metre of strip goes as 1/(distance * this), so
+  // when a 5 m crest carries the ribbon up to within a metre of the camera it
+  // explodes across the frame no matter how narrow the strip is in metres.
+  // abs() because a crest can just as easily lift the strip ABOVE the eyeline,
+  // and that smears exactly as badly.
+  vAbove = abs(dot(cameraPosition - surf, nrm));
 
   vec4 mv = viewMatrix * vec4(surf, 1.0);
   vDepth = -mv.z;
@@ -766,22 +787,32 @@ uniform float uScroll;
 uniform float uRail;
 uniform float uFadeNear;
 uniform float uFadeFar;
+uniform float uSolidNear;
+uniform float uSolidFar;
+uniform float uFillNear;
+uniform float uFillFar;
+uniform float uLensIn;
+uniform float uLensOut;
+uniform float uLowIn;
+uniform float uLowOut;
 
 varying float vSide;
 varying float vDist;
 varying float vDepth;
 varying float vTilt;
+varying float vAbove;
 
 void main() {
   float a = abs(vSide);
 
   // =========================================================================
-  //  This is EMISSIVE INK ON THE SURFACE, not a sheet of green cellophane laid
-  //  over it. The whole strip is near-opaque, so the water bands do NOT pass
-  //  through it and it can never tint the sea underneath; the only place the
-  //  water shows is the one-pixel feather at the very outside of each rail.
-  //  The read is: two hard bright rails with a quieter fill between them, i.e.
-  //  a painted lane, which is what a racing line looks like.
+  //  TWO RAILS AND A WINDOW. The strip is not a painted slab and it is not a
+  //  sheet of cellophane either: the two edge rails are near-opaque emissive
+  //  ink, and the lane BETWEEN them is mostly open water with chevrons floating
+  //  on it. Round 3 had the fill at 0.965 alpha, which is the same thing as
+  //  opaque, and the result was a green surface with a sea lapping at it.
+  //  You have to be able to see the swell through the middle or the ribbon
+  //  stops being a line drawn on the water and becomes the ground.
   // =========================================================================
 
   // ---- edge rails ---------------------------------------------------------
@@ -844,12 +875,26 @@ void main() {
   float glint = step(0.11, vTilt) * 0.5 + step(0.26, vTilt) * 0.5;
 
   // ---- opacity ------------------------------------------------------------
-  // Rails fully opaque, lane fill 0.965, chevrons take the fill to 1.0. The
-  // fill used to be 0.88 and, combined with the blown-out AA width above, 12%
-  // of a high-contrast four-band sea was quite enough to see the water's own
-  // shapes crawling underneath the strip. The only transmission left is the
-  // outer feather, which is what keeps the boundary from staircasing.
-  float alpha = mix(0.965 + mark * 0.035, 1.0, rail) * edge;
+  // The lane fill is a WINDOW near the boat and closes up with distance.
+  //
+  // Those are two different jobs and they want two different alphas. Up close
+  // the ribbon's job is to say "you are on the line" while staying out of the
+  // way of the water and the boats, so the fill runs at uFillNear (~0.22) and
+  // the swell reads straight through it. Past a couple of hundred metres the
+  // strip is only a few pixels across, the two rails and the fill all land in
+  // the same pixel, and a 0.22 fill would average out to nothing — so it ramps
+  // to uFillFar (~0.85) and the far side of the circuit stays a clean graphic
+  // line. Smooth, not stepped: the four-step distance fade below is already
+  // one source of banding along the strip and stacking a second would read as
+  // deliberate segmentation.
+  float far01 = clamp((vDepth - uSolidNear) / max(1.0, uSolidFar - uSolidNear), 0.0, 1.0);
+  float fillA = mix(uFillNear, uFillFar, far01);
+  // Chevrons sit well above the fill so they still read as marks through the
+  // window, and the rails stay near-opaque at every distance — the rails ARE
+  // the racing line, the fill is only the space between them.
+  float markA = mix(0.66, 0.95, far01);
+  float railA = mix(0.93, 1.0, far01);
+  float alpha = mix(mix(fillA, markA, mark), railA, rail) * edge;
 
   // ---- colour -------------------------------------------------------------
   // Value ladder, darkest to brightest: fill < rail < chevron. The rails stay
@@ -866,6 +911,29 @@ void main() {
   float f = clamp((vDepth - uFadeNear) / max(1.0, uFadeFar - uFadeNear), 0.0, 1.0);
   f = floor(f * 4.0 + 0.5) / 4.0;
   alpha *= 1.0 - f;
+
+  // ---- near-camera relief -------------------------------------------------
+  // Two separate guards, because there are two separate ways for a 2.6 m strip
+  // to eat the frame.
+  //
+  // 1. LENS. Anything inside uLensIn metres is simply gone. At arm's length a
+  //    strip lying flat is a smear of green across the lower half of the lens
+  //    and carries no information at all — you cannot tell which way it goes.
+  //
+  // 2. LOW CAMERA. This is what actually produced the round-3 "landmass".
+  //    WAVE_MAX_HEIGHT is 5.06 m and the chase camera rides ~3.5 m up, so a
+  //    crest routinely rises to meet the lens; the ribbon painted on that crest
+  //    is then a metre below the eye and viewed almost exactly edge-on, and it
+  //    covers everything. vAbove is the eye's height above THIS piece of strip
+  //    measured along its own normal, so it collapses precisely in that case
+  //    and is untouched in every ordinary chase frame (where it is 3-4 m).
+  //    Gated by nearW so it only ever applies within ~26 m: out at the horizon
+  //    the far ribbon crosses crests taller than the camera all the time, and
+  //    without the gate it would flicker in and out along the back straight.
+  float lens  = smoothstep(uLensIn, uLensOut, vDepth);
+  float nearW = 1.0 - smoothstep(6.0, 26.0, vDepth);
+  float low   = smoothstep(uLowIn, uLowOut, vAbove);
+  alpha *= lens * mix(1.0, low, nearW);
 
   if (alpha < 0.004) discard;
   gl_FragColor = vec4(col, alpha);
@@ -1002,6 +1070,14 @@ export class Course {
     uRail: { value: number };
     uFadeNear: { value: number };
     uFadeFar: { value: number };
+    uSolidNear: { value: number };
+    uSolidFar: { value: number };
+    uFillNear: { value: number };
+    uFillFar: { value: number };
+    uLensIn: { value: number };
+    uLensOut: { value: number };
+    uLowIn: { value: number };
+    uLowOut: { value: number };
   };
 
   private readonly _startLine: Mesh;
@@ -1055,6 +1131,25 @@ export class Course {
       uRail: { value: RIBBON_RAIL },
       uFadeNear: { value: 540 },
       uFadeFar: { value: 1500 },
+      // Where the lane fill stops being a window and starts being paint. 18 m
+      // covers everything the chase camera has in the near half of the frame,
+      // so what the player is driving over stays see-through; by 120 m the
+      // strip is seen so nearly edge-on that the whole 2.6 m width lands in a
+      // handful of scanlines, and at 0.26 alpha over pale foam it had faded to
+      // an invisible smudge in the first capture of this fix — mid-field
+      // legibility is the thing the ribbon exists for, so the ramp closes
+      // faster than the first attempt.
+      uSolidNear: { value: 18 },
+      uSolidFar: { value: 120 },
+      uFillNear: { value: 0.26 },
+      uFillFar: { value: 0.9 },
+      // Nothing inside 1.1 m, full strength by 4 m.
+      uLensIn: { value: 1.1 },
+      uLensOut: { value: 4.0 },
+      // Gone when the eye is within 0.5 m of the strip's own plane, untouched
+      // once it is 2.7 m above it. A normal chase frame sits at 3-4 m.
+      uLowIn: { value: 0.5 },
+      uLowOut: { value: 2.7 },
     };
     this._ribbon = this.buildRibbon();
     this.object.add(this._ribbon);

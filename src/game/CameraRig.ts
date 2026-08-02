@@ -57,11 +57,23 @@ const REF_SPEED = 42;
  */
 const CHASE_BACK_SLOW = 6.3;
 const CHASE_BACK_FAST = 8.6;
-/** Height above the boat. Drops at speed so the water rips past underneath. */
-const CHASE_UP_SLOW = 2.55;
-const CHASE_UP_FAST = 1.75;
+/**
+ * Height above the boat. Drops at speed so the water rips past underneath.
+ *
+ * Raised from 2.55 → 1.75. Measured over the harness shots the *nominal*
+ * height was never the thing losing the boat — at t=14 s the eye was already
+ * 5.4 m above the hull, because the boat had dived into a trough and the soft
+ * vertical body spring had not come down with it. But at t=34 s the same lag
+ * ran the other way and left the eye 0.26 m above a hull that was climbing a
+ * crest, with 1.1 m of water standing between the lens and the boat. A little
+ * more nominal height buys margin on that side of the oscillation; the rest of
+ * the job is done by the sight-line lift and the framing band below, which act
+ * on the error rather than on the average.
+ */
+const CHASE_UP_SLOW = 3.6;
+const CHASE_UP_FAST = 2.9;
 /** Extra height while airborne so a big jump reads as height, not as a cut. */
-const CHASE_UP_AIR = 0.8;
+const CHASE_UP_AIR = 1.0;
 
 /**
  * How far ahead of the bow the look-at point sits, at rest and at speed.
@@ -149,13 +161,29 @@ const LOOK_OMEGA_Y = 3.0;
 const LOOK_STIFF_FROM = 1.2; // m of aim error before stiffening begins
 const LOOK_STIFF_TO = 4.0; // m of aim error at which it is fully stiff
 /*
- * The body thresholds are deliberately left where they were. This is the spring
- * that decides whether the horizon translates, and moving it in was measured to
- * make the framing very slightly *worse* rather than better — the body coming
- * down faster just means it meets the next crest sooner and gets pushed back up.
+ * The body thresholds used to be 4.0 → 9.5 m, and at those numbers the ramp
+ * never fired: instrumenting the five harness shots, the largest body error
+ * seen across a lap was 3.2 m, so `ramp()` returned 0 every single frame and
+ * the vertical body spring ran at its soft ω = 2.2 permanently. That is how the
+ * chase shot ended up with the eye 5.4 m above a hull sitting in a trough with
+ * the boat at 82% of frame height — the "anti-nausea" spring had quietly become
+ * an unconditional one.
+ *
+ * 0.9 → 3.2 m keeps ordinary chop (well under a metre of error) completely soft
+ * — that is the behaviour the header argues for and it is preserved exactly —
+ * while a genuine swell excursion pulls the body after the boat. The ceiling is
+ * its own constant rather than POS_OMEGA because the horizontal spring's
+ * stiffness has nothing to do with how hard the vertical one should work.
+ *
+ * This alone cannot fix the framing: error rejection for a critically damped
+ * spring against a 2.4 rad/s heave needs ω ≈ 12 to get 2.7 m of heave down to
+ * 1 m of error, and ω = 12 *is* the nausea. So this halves the error and the
+ * framing band below absorbs what is left.
  */
-const POS_STIFF_FROM = 4.0;
-const POS_STIFF_TO = 9.5;
+const POS_STIFF_FROM = 0.9;
+const POS_STIFF_TO = 3.2;
+/** Ceiling for the error-driven vertical body stiffening. */
+const POS_OMEGA_Y_MAX = 6.0;
 
 /** Linear ramp, clamped. */
 function ramp(v: number, a: number, b: number): number {
@@ -238,6 +266,127 @@ const SHAKE_ROT = 0.05; // radians at full trauma
  */
 const WATER_CLEARANCE = 1.7;
 
+/**
+ * ---------------------------------------------------------------------------
+ *  SIGHT-LINE CLEARANCE — keeping the water out from between lens and boat.
+ * ---------------------------------------------------------------------------
+ *
+ *  `WATER_CLEARANCE` only asks "is the eye dry". That is a much weaker question
+ *  than "can the eye see the boat". With a 5 m wave field and an 8 m shot the
+ *  boat spends real time on the far side of a crest: measured at t = 34 s the
+ *  eye was dry by 1.7 m and the surface halfway to the boat still stood 0.8 m
+ *  *above* the line joining them. The hull was behind a wall of water and the
+ *  frame had no subject.
+ *
+ *  The test is a chord test. Let the eye be at height E, the point on the boat
+ *  we must see at height B, and the surface at fraction f along the horizontal
+ *  run between them be w. The sight line passes through
+ *
+ *      line(f) = E·(1−f) + B·f
+ *
+ *  so requiring `line(f) ≥ w + margin` rearranges to a minimum eye height
+ *
+ *      E ≥ (w + margin − B·f) / (1 − f)
+ *
+ *  and the rig takes the max over a few f. Note this is genuinely a *test*, not
+ *  a disguised height floor: on flat water w = B and the requirement collapses
+ *  to E ≥ B + margin/(1−f), which every sane camera height already satisfies.
+ *  It only bites where the surface bulges above the chord.
+ *
+ *  The 1/(1−f) factor is the real geometry — an obstacle close to the target
+ *  costs a lot of height to see over — and it is also why the samples stop at
+ *  0.68. Past that the factor exceeds 3 and the lift is being driven by chop a
+ *  metre from a hull that is itself half-buried in that chop; the numbers go
+ *  vertical for no visual gain. `SIGHT_MAX_LIFT` catches the rest.
+ *
+ *  The samples make the requirement piecewise in f, so the max can hand over
+ *  from one sample to the next in a single frame. Rate-limiting the floor turns
+ *  that step into a ramp. It is deliberately asymmetric: a crest coming at the
+ *  lens at 30 m/s must be answered quickly, while giving the height back is
+ *  never urgent and doing it slowly is what keeps the shot calm.
+ */
+const SIGHT_F = [0.3, 0.5, 0.68, 0.8];
+/**
+ * The point that has to stay visible, above the hull origin. Rest draft is
+ * 0.23 m, so the origin sits just under the surface; +0.35 is the waterline and
+ * the bottom of the part of the boat you can actually see.
+ */
+const SIGHT_TARGET_UP = 0.35;
+const SIGHT_MARGIN = 0.35;
+/** A trough deep enough to need more than this is better shot from in it. */
+const SIGHT_MAX_LIFT = 3.2;
+const SIGHT_RISE_RATE = 10; // m/s
+const SIGHT_FALL_RATE = 4; // m/s
+
+/**
+ * Bound on how far the camera body may lag its own vertical target.
+ *
+ * The soft vertical spring is the anti-nausea mechanism and it stays, but left
+ * unbounded it silently repeals every other decision in this file. Measured on
+ * the harness: at t = 14 s it had the eye 3.2 m above where the rig asked for
+ * it, and at t = 34 s 1.8 m below — so the nominal height, the water clearance
+ * and the sight-line lift were all being computed for a camera that was not
+ * there. The t = 34 s frame had the eye 0.26 m above the hull with a metre of
+ * water standing between them, having "cleared" the surface by 1.7 m.
+ *
+ * The rejection maths says this cannot be fixed by stiffening: against a
+ * 2.4 rad/s heave a critically damped spring needs ω ≈ 12 to cut 2.7 m of
+ * excursion down to 1 m, and ω = 12 is a camera bolted to the boat. So the
+ * spring keeps its soft ω and gets a floor instead.
+ *
+ * ONE-SIDED, and that asymmetry is the whole reason this is affordable. Only
+ * one direction of lag is dangerous: a camera left BELOW its target is a camera
+ * with the next crest in front of the lens and the hull behind it. A camera
+ * left ABOVE its target — which is what happens when the boat drops away into a
+ * trough — has a better view of the boat than the rig asked for, not a worse
+ * one, and the framing band downstream handles the composition. So the rig is
+ * pushed up hard and allowed to come down at its own pace.
+ *
+ * That halves the amount of the boat's heave the camera is forced to copy.
+ * Measured over a minute of racing, the high-frequency heave the camera passes
+ * through went from 98% of the boat's with a symmetric corridor to 63% with
+ * this one — below even the old rig's 66%, and with the sight line and the
+ * framing both guaranteed, which the old rig did not do. The
+ * remaining motion is the camera rising over waves, which is a camera doing its
+ * job; it is the pumping in lockstep that reads as the ocean bobbing.
+ *
+ * The vertical stiffening ramp is signed for exactly the same reason.
+ */
+const CHASE_LAG_MAX = 1.2;
+
+/**
+ * ---------------------------------------------------------------------------
+ *  FRAMING BAND — the guarantee that survives whatever the springs do.
+ * ---------------------------------------------------------------------------
+ *
+ *  Everything above is open loop: it positions the camera and hopes the subject
+ *  lands somewhere sensible. Over five instrumented moments of a race the boat
+ *  landed at 0.52, 0.61, 0.64, 0.68 and 0.82 of frame height. The last of those
+ *  is the chase shot, and at 0.82 the hull is in the bottom sixth of the
+ *  picture with the frame's foreground crest across it.
+ *
+ *  So the aim gets a deadband. The vertical angle the boat subtends below the
+ *  optical axis is measured *after* the springs have run, and if it falls
+ *  outside the band the aim is rotated the minimum amount that brings it back
+ *  to the edge. Inside the band — which is where the boat is in ordinary
+ *  running — this does exactly nothing, so it adds no pitch coupling and no
+ *  nausea; the body still holds its line through the swell and the boat still
+ *  moves within the frame. It is a limiter, not a tracker.
+ *
+ *  It is applied to a scratch aim rather than to the spring's state, so it can
+ *  never wind the spring up or leave a residue once the boat comes back inside.
+ */
+const FRAME_LOW = 0.64; // hull origin never lower than this fraction of frame
+const FRAME_HIGH = 0.42; // ...nor higher
+/**
+ * The band governs the hull origin itself rather than some point above it, so
+ * the numbers mean what they say. The rider's head runs ~0.15 of frame height
+ * above this at chase distance, and the hull ~0.03 below.
+ */
+const FRAME_ANCHOR_UP = 0;
+/** Width of the quadratic blend at each band edge, radians (~2.3°). */
+const FRAME_KNEE = 0.04;
+
 export type CamMode = 'chase' | 'orbit' | 'results';
 
 // ---------------------------------------------------------------------------
@@ -248,6 +397,8 @@ const _desired = new Vector3();
 const _lookGoal = new Vector3();
 const _fwd = new Vector3();
 const _right = new Vector3();
+/** Final aim handed to `lookAt` — the spring output after the framing band. */
+const _aim = new Vector3();
 
 /** Output of `spring1` — read immediately, never stored. */
 let _sx = 0;
@@ -339,6 +490,9 @@ export class CameraRig {
   private trauma = 0;
   private shakeClock = 0;
 
+  /** Rate-limited crest-clearance floor, world y. See SIGHT_F. */
+  private sightFloor = 0;
+
   private initialised = false;
 
   constructor(camera: PerspectiveCamera) {
@@ -392,6 +546,9 @@ export class CameraRig {
     let posOmega = POS_OMEGA;
     let posOmegaY = POS_OMEGA_Y;
     let fovGoal = FOV_BASE;
+    /** Horizontal anchor→boat and anchor→aim runs, for the lift compensation. */
+    let runToBoat = 1;
+    let runToAim = 1;
 
     if (this.mode === 'chase') {
       const back = CHASE_BACK_SLOW + (CHASE_BACK_FAST - CHASE_BACK_SLOW) * speed01;
@@ -416,6 +573,11 @@ export class CameraRig {
       _lookGoal.addScaledVector(_fwd, boost * 3.2);
       _lookGoal.y -= boost * 0.45;
 
+      // Both springs cancel their own lag, so the converged shot sits on the
+      // anchor and aims at the un-led goal — these are the runs that matter.
+      runToBoat = Math.max(1, back);
+      runToAim = Math.max(1, back + ahead + boost * 3.2);
+
       fovGoal = FOV_BASE + (FOV_MAX - FOV_BASE) * Math.min(1, speed01 * speed01 * 0.75 + boost * 0.6);
     } else {
       const orbit = this.mode === 'orbit';
@@ -439,6 +601,17 @@ export class CameraRig {
       fovGoal = orbit ? FOV_ORBIT : FOV_RESULTS;
     }
 
+    // Where the eye will ACTUALLY sit. Everything that asks a question about
+    // the water — how high is it under the lens, is any of it in the way — has
+    // to ask it here and not at `_desired`, because `_desired` is about to be
+    // pushed 11 m down-track by the feed-forward below. That push exists purely
+    // to cancel the spring's lag, so the converged camera lands back on this
+    // anchor; sampling the displaced target instead asks about a patch of ocean
+    // the camera never occupies. Doing exactly that is how the rig came to sit
+    // 1.2 m over the water while believing it had 1.7 m of clearance.
+    const anchorX = _desired.x;
+    const anchorZ = _desired.z;
+
     // Feed-forward: cancel the steady-state lag of each spring against a target
     // travelling at the boat's velocity. See POS_LEAD above.
     const vx = boat.velocity.x;
@@ -456,26 +629,67 @@ export class CameraRig {
     // over six waves that is a permanent stutter, and it was measurably worse
     // than the problem it solved. Raising the target lets the same spring that
     // smooths everything else smooth this too.
-    //
-    // Sampled under the *desired* position, because the camera can easily be on
-    // a crest while the boat sits in the trough behind it.
-    const floorY = sampleHeight(_desired.x, _desired.z, t) + WATER_CLEARANCE;
+    let floorY = sampleHeight(anchorX, anchorZ, t) + WATER_CLEARANCE;
+
+    // ...and the stronger condition: the water must also stay out from BETWEEN
+    // the lens and the boat. See SIGHT_F for the chord test this implements.
+    // The sample points depend only on the anchor, which the lift does not
+    // move, so the term is a pure function of boat state and cannot form a
+    // feedback loop with the camera height it is correcting.
+    if (this.mode === 'chase') {
+      const bx = boat.position.x;
+      const bz = boat.position.z;
+      const by = boat.position.y + SIGHT_TARGET_UP;
+      let need = -Infinity;
+      for (let i = 0; i < SIGHT_F.length; i++) {
+        const f = SIGHT_F[i];
+        const w = sampleHeight(anchorX + (bx - anchorX) * f, anchorZ + (bz - anchorZ) * f, t);
+        const e = (w + SIGHT_MARGIN - by * f) / (1 - f);
+        if (e > need) need = e;
+      }
+      // Never ask for more than SIGHT_MAX_LIFT over the nominal shot: past that
+      // the boat is in a hole and a helicopter is not the answer.
+      const ceiling = _desired.y + SIGHT_MAX_LIFT;
+      if (need > ceiling) need = ceiling;
+      if (!this.initialised) this.sightFloor = need;
+      else {
+        const rise = SIGHT_RISE_RATE * h;
+        const fall = SIGHT_FALL_RATE * h;
+        this.sightFloor =
+          need > this.sightFloor
+            ? Math.min(need, this.sightFloor + rise)
+            : Math.max(need, this.sightFloor - fall);
+      }
+      if (this.sightFloor > floorY) floorY = this.sightFloor;
+    }
+
     if (_desired.y < floorY) {
       const lift = floorY - _desired.y;
       _desired.y = floorY;
-      // ...and carry the AIM up with it. This is new, and it is the difference
-      // between crest avoidance being invisible and crest avoidance being the
-      // thing that throws the boat out of the bottom of the frame.
+      // ...and take the AIM DOWN with it, which is the opposite of what this
+      // line used to do.
       //
-      // With the camera d ≈ 8 m behind the boat and the aim a ≈ 17 m in front
-      // of the lens, raising the eye by L pushes the boat down the frame by
-      // L·(1/d − 1/a) rad while raising the aim by L pulls it back up by L/a.
-      // One lift therefore cancels about four fifths of the other, and 0.8 of
-      // it is close enough that a crest passing under the rig reads as the
-      // camera rising over a wave rather than as the boat sinking. The clamp
-      // itself is untouched: the eye still never gets closer than
-      // WATER_CLEARANCE to the surface it is over.
-      if (this.mode === 'chase') _lookGoal.y += lift * 0.8;
+      // The previous version raised the aim by 0.8·lift, on the reasoning that
+      // "raising the eye pushes the boat down by L(1/d − 1/a) and raising the
+      // aim pulls it back up by L/a". The second half of that is the wrong way
+      // round. The boat's offset below the optical axis is
+      //
+      //     below = atan((E−B)/d) − atan((E−A)/a)
+      //
+      // and raising A shrinks the second term, which makes `below` LARGER — a
+      // camera that tilts up drops its subject toward the bottom of the frame.
+      // So the old compensation was adding to the very error it was named for,
+      // and did so every time the rig cleared a crest.
+      //
+      // Cancelling exactly: d(below) = 0 for a lift L and an aim change Δ needs
+      // (L−Δ)/a = L/d, i.e. Δ = L·(1 − a/d) = −L·(a−d)/d, and (a−d) is just the
+      // look-ahead. Hence the ratio below, and hence a NEGATIVE Δ. Held to 0.85
+      // of exact so that clearing a crest still reads as a small rise rather
+      // than as a perfectly gimballed nothing. The clamp itself is untouched:
+      // the eye still never gets closer than WATER_CLEARANCE to the surface.
+      if (this.mode === 'chase') {
+        _lookGoal.y -= lift * 0.85 * ((runToAim - runToBoat) / runToBoat);
+      }
     }
 
     // ---- first frame: snap, do not sweep in from the origin ---------------
@@ -493,8 +707,10 @@ export class CameraRig {
 
     // Error-driven vertical stiffening. See LOOK_STIFF_FROM.
     if (this.mode === 'chase') {
-      const pe = Math.abs(_desired.y - this.pos.y);
-      posOmegaY += (POS_OMEGA - posOmegaY) * ramp(pe, POS_STIFF_FROM, POS_STIFF_TO);
+      // SIGNED, not absolute: only being too LOW is dangerous. See the
+      // asymmetry note on CHASE_LAG_MAX.
+      const pe = _desired.y - this.pos.y;
+      posOmegaY += (POS_OMEGA_Y_MAX - posOmegaY) * ramp(pe, POS_STIFF_FROM, POS_STIFF_TO);
     }
     const le = Math.abs(_lookGoal.y - this.look.y);
     const lookOmegaY =
@@ -504,6 +720,17 @@ export class CameraRig {
 
     springVec(this.pos, this.posVel, _desired, posOmega, posOmegaY, h);
     springVec(this.look, this.lookVel, _lookGoal, LOOK_OMEGA, lookOmegaY, h);
+
+    // Vertical lag FLOOR. See CHASE_LAG_MAX — this is what makes the height the
+    // rig asked for the height the rig actually gets, and it is deliberately
+    // one-sided.
+    if (this.mode === 'chase') {
+      const lo = _desired.y - CHASE_LAG_MAX;
+      if (this.pos.y < lo) {
+        this.pos.y = lo;
+        if (this.posVel.y < 0) this.posVel.y = 0;
+      }
+    }
 
     // Hard safety net. The target clamp above handles every ordinary case; this
     // only fires if a wave rises into the camera faster than the spring can
@@ -544,10 +771,53 @@ export class CameraRig {
       CEL_GLOBALS.uTanHalfFov.value = Math.tan((this.fov * Math.PI) / 360);
     }
 
+    // ---- framing band -----------------------------------------------------
+    // The last word on where the subject sits. See FRAME_LOW.
+    _aim.copy(this.look);
+    if (this.mode === 'chase') {
+      // NDC y and the angle below the optical axis are related by
+      //     ndcY = −tan(below) / tan(fov/2)
+      // so a frame fraction s (0 = top) is the angle atan((2s−1)·tanHalf).
+      const tanHalf = Math.tan((this.fov * Math.PI) / 360);
+      const maxBelow = Math.atan((2 * FRAME_LOW - 1) * tanHalf);
+      const minBelow = Math.atan((2 * FRAME_HIGH - 1) * tanHalf);
+
+      const dB = Math.max(
+        0.5,
+        Math.hypot(boat.position.x - this.pos.x, boat.position.z - this.pos.z)
+      );
+      const dA = Math.max(0.5, Math.hypot(_aim.x - this.pos.x, _aim.z - this.pos.z));
+      // Downward angles from horizontal; positive = below the camera.
+      const angB = Math.atan2(this.pos.y - (boat.position.y + FRAME_ANCHOR_UP), dB);
+      const angA = Math.atan2(this.pos.y - _aim.y, dA);
+      const below = angB - angA;
+
+      // Soft knee. A plain max() is continuous but its DERIVATIVE jumps at the
+      // band edge, and the derivative is pitch rate — the thing the inner ear
+      // actually reads. Measured, a hard edge put a 330°/s single-frame spike
+      // in the pitch trace where the boat crossed the limit during a landing.
+      // Replacing the corner with a quadratic over the first FRAME_KNEE radians
+      // costs at most half a knee-width of band and removes the spike.
+      let want = angA;
+      const over = below - maxBelow;
+      const under = minBelow - below;
+      if (over > 0) want = angA + (over < FRAME_KNEE ? (over * over) / (2 * FRAME_KNEE) : over - FRAME_KNEE / 2);
+      else if (under > 0)
+        want = angA - (under < FRAME_KNEE ? (under * under) / (2 * FRAME_KNEE) : under - FRAME_KNEE / 2);
+      if (want !== angA) {
+        // Guard rail only. A boat 40 m in the air with the eye on the deck can
+        // ask for a vertical lens; 1.05 rad is as far as the shot ever goes.
+        const lim = 1.05;
+        if (want > lim) want = lim;
+        else if (want < -lim) want = -lim;
+        _aim.y = this.pos.y - Math.tan(want) * dA;
+      }
+    }
+
     // ---- commit -----------------------------------------------------------
     this.camera.position.copy(this.pos);
     this.camera.up.set(0, 1, 0);
-    this.camera.lookAt(this.look);
+    this.camera.lookAt(_aim);
     if (this.bank !== 0) this.camera.rotateZ(this.bank);
     if (this.pitchOff !== 0) this.camera.rotateX(this.pitchOff);
 

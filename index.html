@@ -5,11 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>WAKE RUNNER — cel-shaded ocean racing</title>
     <style>
-      :root { color-scheme: dark; }
+      /*
+        The shell shares the game's palette exactly — ink, paper, racing-line
+        green, player red. A title card in a different visual language would
+        read as a wrapper around the game instead of part of it.
+
+        Deliberately single-theme: this is an arcade screen, not a document.
+      */
+      :root {
+        --ink: #0a1622;
+        --ink-2: #14304a;
+        --paper: #f4feff;
+        --green: #4dffb0;
+        --red: #ff4f3b;
+        --cyan: #2fc3dd;
+        --sea: #0a3f6e;
+        color-scheme: dark;
+      }
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body { width: 100%; height: 100%; overflow: hidden; background: #0a1622; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: var(--ink); }
       body {
-        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable",
+          "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
         -webkit-font-smoothing: antialiased;
         touch-action: none;
       }
@@ -17,11 +34,121 @@
       canvas { display: block; width: 100%; height: 100%; }
       #hud { position: fixed; inset: 0; pointer-events: none; }
       #hud canvas { position: absolute; inset: 0; }
+
+      /* ---- title card ---------------------------------------------------- */
+      #gate {
+        position: fixed; inset: 0; z-index: 10;
+        display: grid; place-items: center;
+        padding: 24px;
+        background:
+          radial-gradient(120% 90% at 50% 40%, rgba(10, 22, 34, 0.35) 0%, rgba(10, 22, 34, 0.82) 70%);
+        transition: opacity 420ms ease, visibility 420ms;
+      }
+      #gate[hidden] { opacity: 0; visibility: hidden; display: grid; pointer-events: none; }
+
+      /* The HUD draws its panels as slightly-rotated ink plates. Match it. */
+      .plate {
+        background: var(--paper);
+        border: 4px solid var(--ink);
+        box-shadow: 10px 10px 0 rgba(10, 22, 34, 0.55);
+        padding: 30px 34px 26px;
+        max-width: 520px;
+        width: 100%;
+        transform: rotate(-0.5deg);
+        clip-path: polygon(0 0, 100% 0, 100% calc(100% - 18px), calc(100% - 18px) 100%, 0 100%);
+      }
+
+      .eyebrow {
+        font-size: 12px; font-weight: 800; letter-spacing: 0.22em;
+        text-transform: uppercase; color: var(--sea);
+      }
+      h1 {
+        font-size: clamp(38px, 8.5vw, 62px);
+        line-height: 0.88;
+        font-weight: 900;
+        letter-spacing: -0.035em;
+        text-transform: uppercase;
+        color: var(--ink);
+        text-wrap: balance;
+        margin: 8px 0 2px;
+        /* Hard offset in player red — the same treatment the HUD gives the
+           position ordinal. No blur: this world has no soft shadows. */
+        text-shadow: 5px 5px 0 var(--red);
+      }
+      h1 .b { display: block; color: var(--sea); text-shadow: 5px 5px 0 var(--cyan); }
+      .tagline {
+        margin-top: 14px; font-size: 15px; line-height: 1.5; color: #2a4257;
+        max-width: 42ch;
+      }
+
+      .keys {
+        margin-top: 22px; padding-top: 18px;
+        border-top: 3px solid var(--ink);
+        display: grid; grid-template-columns: auto 1fr; gap: 9px 16px;
+        align-items: center;
+        font-size: 14px; color: #223a4d;
+      }
+      kbd {
+        display: inline-block;
+        font: inherit; font-weight: 800; font-size: 12px;
+        letter-spacing: 0.04em;
+        background: var(--ink); color: var(--paper);
+        border-radius: 3px; padding: 5px 9px; white-space: nowrap;
+      }
+      .keys b { font-weight: 800; color: var(--ink); }
+
+      #start {
+        margin-top: 24px; width: 100%;
+        font: inherit; font-size: 19px; font-weight: 900;
+        letter-spacing: 0.16em; text-transform: uppercase;
+        color: var(--ink); background: var(--green);
+        border: 4px solid var(--ink); border-radius: 0;
+        padding: 15px 20px; cursor: pointer;
+        box-shadow: 6px 6px 0 var(--ink);
+        transition: transform 90ms ease, box-shadow 90ms ease, background 90ms ease;
+      }
+      #start:hover { background: #7dffc6; }
+      #start:active { transform: translate(6px, 6px); box-shadow: 0 0 0 var(--ink); }
+      #start:focus-visible { outline: 4px solid var(--cyan); outline-offset: 4px; }
+      #start[disabled] { background: #cfe4ea; cursor: progress; box-shadow: 6px 6px 0 #7d93a1; }
+
+      .foot { margin-top: 14px; font-size: 12px; color: #5b7386; letter-spacing: 0.02em; }
+
+      @media (prefers-reduced-motion: reduce) {
+        #gate, #start { transition: none; }
+      }
+      @media (max-height: 560px) {
+        .plate { padding: 20px 22px 18px; }
+        .keys { display: none; }
+      }
     </style>
   </head>
   <body>
     <div id="app"></div>
     <div id="hud"></div>
+
+    <div id="gate">
+      <div class="plate">
+        <div class="eyebrow">Three laps · open ocean</div>
+        <h1>Wake<span class="b">Runner</span></h1>
+        <p class="tagline">
+          Cel-shaded arcade racing on an infinite Gerstner sea. Every mesh, texture
+          and sound in this page was generated in code — nothing is loaded.
+        </p>
+
+        <div class="keys">
+          <span><kbd>W</kbd> <kbd>S</kbd></span><span><b>Throttle</b> and brake</span>
+          <span><kbd>A</kbd> <kbd>D</kbd></span><span><b>Steer</b> — turns tighten with speed</span>
+          <span><kbd>Space</kbd></span
+          ><span><b>Powerslide</b> — hold through a corner, release for boost</span>
+          <span><kbd>R</kbd></span><span><b>Restart</b> the race</span>
+        </div>
+
+        <button id="start" disabled>Loading…</button>
+        <div class="foot">Arrow keys, gamepad and touch also work.</div>
+      </div>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
