@@ -37,6 +37,8 @@ class ResearchState(TypedDict, total=False):
     halt_detail: str | None
 
     # endgame (deterministic)
+    stop_reason: str | None
+    final_threshold: dict | None
     finalists: list[str]
     oos: list[dict]
     champion: dict | None

@@ -7,8 +7,9 @@ variant:
 * the signal computed with data up to bar t's close is executed at bar t+1's
   open (``pos = signal.shift(1 + delay)``) and earns the open-to-open return;
 * every unit of turnover pays taker fee + slippage;
-* funding is charged on the position held at each funding bar
-  (long pays positive funding).
+* funding is charged on the position held at each funding timestamp, i.e. the
+  position carried INTO bar t (before bar t's open execution); long pays
+  positive funding.
 """
 from __future__ import annotations
 
@@ -40,8 +41,13 @@ def run(df: pd.DataFrame, signal: np.ndarray, costs: Costs,
     ret[:-1] = o[1:] / o[:-1] - 1.0          # earned while holding bar t
     turnover = np.abs(np.diff(pos, prepend=0.0))
     funding = df["funding_rate"].to_numpy()
-    pnl = pos * ret - turnover * (costs.taker_fee + costs.slippage) * fee_mult - pos * funding
+    held_at_settlement = np.concatenate([[0.0], pos[:-1]])
+    pnl = pos * ret - turnover * cost_rate(costs, fee_mult) - held_at_settlement * funding
     return Result(pnl=pnl, pos=pos)
+
+
+def cost_rate(costs: Costs, fee_mult: float = 1.0) -> float:
+    return (costs.taker_fee + costs.slippage) * fee_mult
 
 
 def sharpe(pnl: np.ndarray, bars_per_year: int) -> float:
@@ -81,13 +87,28 @@ class WFResult:
     chosen: list[int]              # grid index picked per fold (inner selection)
     folds: list[tuple[int, int, int]]  # (test_start, test_end, chosen k)
 
-    def apply(self, pnl_grid: np.ndarray) -> np.ndarray:
+    def apply(self, pnl_grid: np.ndarray, pos_grid: np.ndarray, rate: float) -> np.ndarray:
         """Same fold/param selection applied to a stressed grid (fees x2, delay...)."""
-        return np.concatenate([pnl_grid[a:b, k] for a, b, k in self.folds])
+        return _stitch(pnl_grid, pos_grid, self.folds, rate)
+
+
+def _stitch(pnl_grid: np.ndarray, pos_grid: np.ndarray, folds, rate: float) -> np.ndarray:
+    """Concatenate per-fold columns, charging the real turnover when the chosen
+    parameter set changes at a fold boundary (each column only paid its own)."""
+    out = []
+    for i, (a, b, k) in enumerate(folds):
+        seg = pnl_grid[a:b, k].copy()
+        if i > 0 and folds[i - 1][2] != k:
+            prev_k = folds[i - 1][2]
+            charged = abs(pos_grid[a, k] - pos_grid[a - 1, k])
+            actual = abs(pos_grid[a, k] - pos_grid[a - 1, prev_k])
+            seg[0] -= (actual - charged) * rate
+        out.append(seg)
+    return np.concatenate(out)
 
 
 def walk_forward(pnl_grid: np.ndarray, pos_grid: np.ndarray, wf: WalkForward,
-                 bars_per_year: int) -> WFResult:
+                 bars_per_year: int, rate: float) -> WFResult:
     """Expanding-window WF over a (bars x K) grid of per-combo pnl.
 
     Parameter selection happens *inside* each training window; the OOF test
@@ -111,7 +132,7 @@ def walk_forward(pnl_grid: np.ndarray, pos_grid: np.ndarray, wf: WalkForward,
         start = end
     if not oof_pnl:
         raise ValueError("research segment too short for walk-forward")
-    return WFResult(np.concatenate(oof_pnl), np.concatenate(oof_pos),
+    return WFResult(_stitch(pnl_grid, pos_grid, spans, rate), np.concatenate(oof_pos),
                     np.concatenate(oof_idx), folds, chosen, spans)
 
 

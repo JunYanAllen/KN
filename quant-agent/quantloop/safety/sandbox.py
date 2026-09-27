@@ -12,6 +12,7 @@ produced by untrusted code.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -52,20 +53,15 @@ def main():
 
     status = {"ok": True}
     try:
-        # Truncated prefixes first, full series last.
-        inv = []
-        for k in spec["invariance_combos"]:
+        # Truncated prefixes first, full series last. The comparison happens on the HOST:
+        # nothing in this interpreter (which untrusted code shares) decides pass/fail.
+        parts = {}
+        for k in range(len(spec["grid"])):
             for t in spec["cuts"]:
-                inv.append((k, t, call(df.iloc[:t], spec["grid"][k])))
+                parts[f"k{k}_t{t}"] = call(df.iloc[:t], spec["grid"][k])
         signals = np.stack([call(df, p) for p in spec["grid"]])
-        mismatches = []
-        for k, t, part in inv:
-            full = signals[k, :t]
-            bad = ~(np.isclose(part, full, atol=1e-9, equal_nan=True))
-            if bad.any():
-                mismatches.append({"combo": k, "cut": t, "first_bad_bar": int(np.argmax(bad)), "n_bad": int(bad.sum())})
-        status["invariance_mismatches"] = mismatches
         np.save(f"{work}/out/signals.npy", signals, allow_pickle=False)
+        np.savez(f"{work}/out/prefixes.npz", **parts)
     except Exception as e:
         tb = traceback.format_exc(limit=6)
         tb = tb[-2500:]
@@ -85,21 +81,28 @@ class SandboxResult:
     detail: dict = field(default_factory=dict)
 
 
-def _prepare(work: Path, code: str, df: pd.DataFrame, grid: list[dict],
-             cuts: list[int], invariance_combos: list[int]) -> None:
+def _prepare(work: Path, code: str, df: pd.DataFrame, grid: list[dict], cuts: list[int]) -> None:
     (work / "out").mkdir()
     (work / "strategy.py").write_text(code)
     (work / "harness.py").write_text(HARNESS)
     cols = list(df.columns)
     np.savez(work / "data.npz", index_ns=df.index.asi8, **{c: df[c].to_numpy() for c in cols})
     (work / "spec.json").write_text(json.dumps(
-        {"columns": cols, "grid": grid, "cuts": cuts, "invariance_combos": invariance_combos}))
+        {"columns": cols, "grid": grid, "cuts": cuts}))
+    # readable by an unprivileged container user; only out/ is writable
+    os.chmod(work, 0o755)
+    for f in work.iterdir():
+        os.chmod(f, 0o777 if f.name == "out" else 0o644)
 
 
-def _collect(work: Path, n: int, k: int) -> SandboxResult:
+def _collect(work: Path, n: int, k: int, cuts: list[int], returncode: int, stderr: bytes) -> SandboxResult:
     status_path = work / "out" / "status.json"
     if not status_path.exists():
-        return SandboxResult(False, "E_RUNTIME", "sandbox produced no status (killed by rlimit?)")
+        if returncode < 0:          # killed by a signal: rlimit (CPU / memory) hit by the strategy code
+            return SandboxResult(False, "E_RUNTIME", f"strategy process killed by signal {-returncode} "
+                                                     "(CPU or memory limit exceeded)")
+        return SandboxResult(False, "E_INFRA", f"sandbox failed to start (exit {returncode}): "
+                                               f"{stderr.decode(errors='replace')[-500:]}")
     status = json.loads(status_path.read_text())
     if not status.get("ok"):
         msg = f"{status.get('error_type')}: {status.get('error')}\n{status.get('traceback', '')}"
@@ -108,13 +111,21 @@ def _collect(work: Path, n: int, k: int) -> SandboxResult:
     sig = np.load(work / "out" / "signals.npy", allow_pickle=False)
     if sig.shape != (k, n):
         return SandboxResult(False, "E_SCHEMA", f"signals shape {sig.shape} != {(k, n)}")
-    if status["invariance_mismatches"]:
-        m = status["invariance_mismatches"][0]
-        return SandboxResult(False, "E_LOOKAHEAD_DYNAMIC",
-                             f"truncation-invariance failed: signal at bar {m['first_bad_bar']} changes when "
-                             f"data after bar {m['cut']} is removed ({m['n_bad']} bars differ). "
-                             "The signal must only use data up to and including the current bar.",
-                             detail={"mismatches": status["invariance_mismatches"]})
+    prefixes = np.load(work / "out" / "prefixes.npz", allow_pickle=False)
+    for kk in range(k):
+        for t in cuts:
+            part = prefixes[f"k{kk}_t{t}"]
+            full = sig[kk, :t]
+            if part.shape != full.shape:
+                return SandboxResult(False, "E_SCHEMA", f"truncated call returned shape {part.shape}")
+            bad = ~np.isclose(part, full, atol=1e-9, equal_nan=True)
+            if bad.any():
+                first = int(np.argmax(bad))
+                return SandboxResult(False, "E_LOOKAHEAD_DYNAMIC",
+                                     f"truncation-invariance failed for param combo #{kk}: the signal at bar "
+                                     f"{first} changes when data after bar {t} is removed ({int(bad.sum())} bars "
+                                     "differ). The signal must only use data up to and including the current bar.",
+                                     detail={"combo": kk, "cut": t, "first_bad_bar": first})
     return validate_signals(sig)
 
 
@@ -132,12 +143,12 @@ def validate_signals(sig: np.ndarray) -> SandboxResult:
     return SandboxResult(True, signals=finite)
 
 
-def _cuts(n: int) -> list[int]:
-    return sorted({int(n * f) for f in (0.35, 0.6, 0.85)})
-
-
-def _inv_combos(k: int) -> list[int]:
-    return sorted({0, k // 2, k - 1})
+def _cuts(n: int, code: str) -> list[int]:
+    """Two pseudo-random cuts (seeded by the code, so reproducible) plus n-1, which verifies
+    every bar except the last one."""
+    seed = int(hashlib.sha256(code.encode()).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+    return sorted({int(n * rng.uniform(0.3, 0.6)), int(n * rng.uniform(0.6, 0.95)), n - 1})
 
 
 class SubprocessSandbox:
@@ -156,19 +167,20 @@ class SubprocessSandbox:
     def run(self, code: str, df: pd.DataFrame, grid: list[dict]) -> SandboxResult:
         work = Path(tempfile.mkdtemp(prefix="ql-sbx-"))
         try:
-            _prepare(work, code, df, grid, _cuts(len(df)), _inv_combos(len(grid)))
+            cuts = _cuts(len(df), code)
+            _prepare(work, code, df, grid, cuts)
             env = {"PATH": "/usr/bin:/bin", "PYTHONHASHSEED": "0",
                    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
             try:
-                subprocess.run([sys.executable, "-I", str(work / "harness.py"), str(work)],
-                               cwd=work, env=env, preexec_fn=self._limits,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               timeout=self.timeout_s, check=False)
+                p = subprocess.run([sys.executable, "-I", str(work / "harness.py"), str(work)],
+                                   cwd=work, env=env, preexec_fn=self._limits,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   timeout=self.timeout_s, check=False)
             except subprocess.TimeoutExpired:
                 return SandboxResult(False, "E_TIMEOUT", f"exceeded {self.timeout_s:.0f}s")
             except OSError as e:
                 return SandboxResult(False, "E_INFRA", f"could not start sandbox: {e}")
-            return _collect(work, len(df), len(grid))
+            return _collect(work, len(df), len(grid), cuts, p.returncode, p.stderr)
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -197,18 +209,21 @@ class DockerSandbox(SubprocessSandbox):
     def run(self, code: str, df: pd.DataFrame, grid: list[dict]) -> SandboxResult:
         work = Path(tempfile.mkdtemp(prefix="ql-sbx-"))
         try:
-            _prepare(work, code, df, grid, _cuts(len(df)), _inv_combos(len(grid)))
-            os.chmod(work / "out", 0o777)
+            cuts = _cuts(len(df), code)
+            _prepare(work, code, df, grid, cuts)
             name = f"ql-sbx-{work.name}"
             try:
-                subprocess.run(self.command(work, name), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               timeout=self.timeout_s, check=False)
+                p = subprocess.run(self.command(work, name), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   timeout=self.timeout_s, check=False)
             except subprocess.TimeoutExpired:
                 # Killing the docker client does not stop the container.
                 subprocess.run(["docker", "kill", name], capture_output=True, check=False)
                 return SandboxResult(False, "E_TIMEOUT", f"exceeded {self.timeout_s:.0f}s")
             except OSError as e:
                 return SandboxResult(False, "E_INFRA", f"docker unavailable: {e}")
-            return _collect(work, len(df), len(grid))
+            if p.returncode in (125, 126, 127):     # docker itself failed (daemon, image, runtime)
+                return SandboxResult(False, "E_INFRA", f"docker exit {p.returncode}: "
+                                                       f"{p.stderr.decode(errors='replace')[-500:]}")
+            return _collect(work, len(df), len(grid), cuts, p.returncode, p.stderr)
         finally:
             shutil.rmtree(work, ignore_errors=True)

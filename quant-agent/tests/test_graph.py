@@ -12,7 +12,7 @@ from quantloop.graph import build_graph
 from quantloop.run import make_deps
 from quantloop.safety.sandbox import SandboxResult
 
-TRENDY = 0.00003     # synthetic market with a real, persistent trend component
+TRENDY = 0.00004     # synthetic market with a real, persistent trend component
 
 
 def run(tmp_path, cfg=None, snapshot=None, thread="t1", sandbox=None, name="run"):

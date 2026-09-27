@@ -19,9 +19,9 @@ class Splits:
     oos:      each pre-registered finalist sees it at most once (0 bits to LLM)
     lockbox:  champion only, once per data snapshot, result goes to humans only
     """
-    research: float = 0.55
-    shadow: float = 0.15
-    oos: float = 0.18
+    research: float = 0.52
+    shadow: float = 0.12
+    oos: float = 0.24          # OOS power matters more than anything else: keep it long
     lockbox: float = 0.12
 
 
@@ -45,7 +45,7 @@ class Limits:
     max_ideas: int = 6                     # strategy re-ideation loop (C)
     max_refines_per_idea: int = 3          # param/logic refine loop (B)
     max_debug_attempts: int = 4            # execution-error repair loop (A)
-    max_same_error: int = 2                # identical normalized error hash -> give up
+    max_same_error: int = 3                # same normalized error seen 3x -> give up (ladder fully tried)
     max_stalls: int = 2                    # consecutive non-improving refines
     max_finalists: int = 2
     max_oos_per_snapshot: int = 3          # lifetime, across runs (ledger-enforced)
@@ -71,9 +71,10 @@ class ISGate:
 
 @dataclass(frozen=True)
 class OOSGate:
-    # OOS is judged against the haircut IS expectation, not a fixed threshold.
-    haircut: float = 0.5
-    se_multiplier: float = 1.0
+    # One-sided test that the OOS Sharpe is > 0, family-wise alpha split over the
+    # pre-registered finalists (Bonferroni). A fixed "SR >= 0.5" rule would pass
+    # pure noise ~31% of the time on one year of data.
+    alpha: float = 0.10
 
 
 @dataclass(frozen=True)

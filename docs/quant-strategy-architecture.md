@@ -82,7 +82,7 @@ START → init_run（公布門檻曲線）→ strategist ──→ coder → sta
                                      ▲              ▲        │  ▲            │                               │
                                      │              │        ▼  │            ▼                               │
                                      │              │     debugger ◄─────────┘  迴圈 A：除錯 ≤4 次；       │
-                                     │              │        │                   同一錯誤 hash 出現 2 次即放棄│
+                                     │              │        │                   同一錯誤 hash 出現 3 次即放棄│
                                      │              │        └→ abandon_variant                              │
                                      │              └─ reflect / control_change ◄────────────────────────────┤
                                      │                 迴圈 B：改良 ≤3 次；達標即停；連續 2 次沒進步即停       │
@@ -90,7 +90,8 @@ START → init_run（公布門檻曲線）→ strategist ──→ coder → sta
                                            迴圈 C：想法 ≤6 個
                                               │
                                               ▼
-            finalize（純程式）：用最終 N 重新折算 DSR → shadow 段 → 事先登記順序的決賽者（≤2）→ 每人看一次 OOS
+            finalize（純程式）：用最終 N 重新折算 DSR → shadow 段 → 事先登記順序的決賽者（≤2）
+                               → 依序看 OOS（單尾檢定 SR>0，α 以 Bonferroni 分給各決賽者），第一位通過即停
                  ├─ 有冠軍 → lockbox_eval（每個快照 1 次）→ human_review [interrupt] → report → END
                  └─ 沒有冠軍 ──────────────────────────────────────────────────────→ report → END
 ```
@@ -130,13 +131,13 @@ START → init_run（公布門檻曲線）→ strategist ──→ coder → sta
 | 需求 | 實作方式 |
 |---|---|
 | 回測引擎固定，LLM 只寫訊號 | `engine.py`：訊號延後 1 根、次根開盤成交、taker 手續費加滑價、資金費率。LLM 只產生 `generate_signals(df, params)` 和 `PARAM_SPACE` |
-| 前視防護放在框架層 | AST 靜態掃描（負 shift、`center=True`、`bfill`、I/O、日期字面值、dunder）＋沙盒內的**截斷不變性測試**，先跑截斷資料，最後跑全量；每次呼叫都用新的 namespace |
-| 三層資料紀律 | research（WF，唯一給 LLM 看的數字）→ shadow → OOS（決賽者各 1 次，每快照終身上限 3 次）→ lockbox（每快照 1 次，只給人看） |
-| 試驗帳本與多重檢定 | SQLite 帳本跨 run 共用；**變體**才算試驗，語法修復和重複程式碼不算；DSR 用同一組試驗的 N 和 V[SR]；finalize 時用最終 N 重新折算 |
+| 前視防護放在框架層 | AST 靜態掃描（負 shift、`center=True`、`bfill`、I/O、模組逃逸、屬性指派／monkey-patch、日期字面值、dunder）＋**截斷不變性測試**：**每一組**參數都在兩個隨機切點和 n−1 上跑，最後才跑全量；比對在 **host 端**進行，而不是在不受信任的直譯器裡 |
+| 三層資料紀律 | research（WF，唯一給 LLM 看的數字）→ shadow → OOS（依事先登記的順序，每人最多 1 次；每快照終身上限 3 次；以單尾 PSR 檢定，α 以 Bonferroni 分配）→ lockbox（每快照 1 次，只給人看；沙盒故障不會消耗額度） |
+| 試驗帳本與多重檢定 | SQLite 帳本跨 run 共用；**變體**才算試驗，語法修復和重複程式碼不算；DSR 用同一組試驗的 N 和 V[SR]；finalize 時用最終 N 重新折算，並在報告揭露「實際需要的 IS Sharpe」和試驗離散度 |
 | 是否達標由程式判定 | `passes_is_gate()` 和所有 router 都是純程式；門檻從不進 prompt |
-| 三種迴圈分開計數，並有預算上限 | 除錯、改良、想法各自有上限；另有 USD、active time（不含人工等待）、每快照試驗數上限；超過就 `halt_reason` → finalize → report，不會崩潰 |
+| 三種迴圈分開計數，並有預算上限 | 除錯、改良、想法各自有上限；另有 USD、active time（不含人工等待）、每快照試驗數上限；超過就 `halt_reason` → finalize → report，不會崩潰；報告寫明 `stop_reason` |
 | State 只放小資料 | 程式碼、訊號網格、PnL 存在內容定址的 artifact store，state 只存 ref；可以用 SqliteSaver 跨進程恢復（有測試） |
-| 沙盒 | `SubprocessSandbox`（開發用：空環境變數、rlimit、逾時強殺；**不隔離網路**）；`DockerSandbox`（`--network none`、唯讀、非 root、cap-drop、gVisor） |
+| 沙盒 | `SubprocessSandbox`（開發用：空環境變數、rlimit、逾時強殺；**不隔離網路**；接真實 LLM 時 `make_deps` 會拒絕使用，除非明確允許）；`DockerSandbox`（`--network none`、唯讀、非 root、cap-drop、gVisor；docker 本身故障歸類為 E_INFRA，不會丟給 LLM 除錯） |
 | HITL | `human_review` 前面沒有副作用；審閱包包含程式碼、參數、IS/shadow/OOS/lockbox、試驗數、門檻曲線、成本假設 |
 | 結構化輸出 | Pydantic schema；schema 失敗會帶錯誤重試 1 次；refusal 和連線錯誤（transient）分開處理 |
 | 可觀測、可重現 | 事件 JSONL（每次 LLM 呼叫、每個節點、每次路由與原因）、設定指紋、prompt 版本、資料快照 hash |
@@ -145,14 +146,31 @@ START → init_run（公布門檻曲線）→ strategist ──→ coder → sta
 
 ## 5. 參考實作的驗證結果
 
-離線執行（stub LLM ＋ 合成資料），langgraph 1.2.12，**25 個測試全部通過**：
+離線執行（stub LLM ＋ 合成資料），langgraph 1.2.12，**38 個測試全部通過**：
 
 - **除錯迴圈**：stub 刻意犯三種錯（NameError、`shift(-1)`、全樣本 z-score），全部被抓到並修好；其中全樣本 z-score 只有截斷不變性測試抓得到，AST 掃描看不出來。
-- **誠實的結果**：在預設的稀薄 alpha 資料上，i1.v1 在第 2 次試驗時通過 IS 閘門（DSR 0.997）。等到 finalize 用最終 N=15 重新折算，它就被淘汰，最後沒有任何決賽者。這正是「早期通過其實是被灌水」的效應。
+- **誠實的結果**：在預設的稀薄 alpha 資料上，i1.v1 在第 2 次試驗時通過 IS 閘門（DSR 0.99）。等到 finalize 用最終 N=11 重新折算，它就被淘汰，最後沒有任何決賽者。報告揭露了原因：試驗間離散度是虛無假設下的 5.97 倍，實際需要 IS Sharpe 3.86 才能通過。這正是「早期通過其實是被灌水」的效應。
 - **完整 HITL 路徑**：在帶有真實趨勢的合成資料上，會依序走完 IS → 重新折算 → shadow → OOS → lockbox → interrupt。回覆不合法時會重新詢問；也測過從 SQLite checkpoint 在新的 app 實例中恢復，且沒有重跑研究。
 - **資訊隔離**：確認所有送進 LLM 的 payload 都不含 oos/lockbox/shadow/dsr 等鍵，也不含 OOS 的數值。
 - **故障路徑**：預算耗盡時會正常收尾，花費不超過上限；沙盒基礎設施故障時會 halt，不會寫出錯誤的 lesson。
 - **反思增益**：報告會輸出 reflect 組和 control 組的改善率。stub 的反思沒有贏過對照組，**這個數字正是設計要量的東西**。
+
+### 對抗式 code review（第二輪 agent）與修正
+
+另一個審查 agent 用腳本實際重現了 10 個問題，全部已修正並補上回歸測試：
+
+| 嚴重度 | 問題 | 修正 |
+|---|---|---|
+| 高 | OOS 判準的標準誤單位錯誤，實際上退化成「SR>0 就通過」，純雜訊下每位決賽者有 50% 假陽性 | 改成單尾 PSR 檢定 SR>0，α=0.10 以 Bonferroni 分配；OOS 段拉長到 24% |
+| 高 | 截斷不變性只抽查 3 組參數，`lag=-1` 可以混進去；比對在不受信任的直譯器內執行，可被 `np.isclose = …` 繞過 | 每一組參數都檢查；比對移到 host 端；AST 禁止屬性指派 |
+| 高 | AST 黑名單有漏洞：`pd.read_table`、`tofile`、`pd.io.common.os.system` 等 | 只允許 `import numpy/pandas/math`；封鎖子模組鏈、I/O、`query`/`eval`/`random` |
+| 高 | DockerSandbox 的暫存目錄權限是 0700，非 root 容器讀不到；docker 故障被當成程式錯誤丟給 LLM | 調整權限（755/644/777）；docker 的 125–127 退出碼歸類為 E_INFRA |
+| 中 | 公布的門檻曲線只用虛無變異數，嚴重低估實際門檻 | 改用帳本中的實際 V[SR]，並在 finalize 揭露最終門檻 |
+| 中 | 同一錯誤 2 次就放棄，升級階梯從未走到強模型 | 改成 3 次（便宜修補 → 強模型修補 → 放棄） |
+| 中 | LLM 連線失敗、反思第 2 次呼叫中止時，已付的費用漏記 | 例外帶著累計花費一起拋出 |
+| 中 | 預算或試驗上限觸發的停止，報告寫成 `halt_reason=None` | 新增 `stop_reason` |
+| 低 | 參數值型別混雜會讓 run 崩潰；WF 在 fold 邊界換參數時沒算換倉成本；lockbox 遇到沙盒錯誤會燒掉額度 | 參數值型別驗證；補計邊界換倉成本；沙盒錯誤不寫入 lockbox |
+| 待確認 | 資金費率應扣在哪個持倉 | 改為結算時點持有的倉位（進入 bar t 前的倉位） |
 
 ### 已知限制
 

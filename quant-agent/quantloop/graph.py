@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from .nodes import Deps, build_nodes
+from .nodes import Deps, budget_reason, build_nodes
 from .state import ResearchState
 
 
@@ -30,16 +30,7 @@ def build_graph(deps: Deps, checkpointer=None):
     n = build_nodes(deps)
 
     def over_budget(s: ResearchState) -> str | None:
-        sp = s.get("spent") or {}
-        if s.get("halt_reason"):
-            return s["halt_reason"]
-        if sp.get("usd", 0) >= L.usd:
-            return "budget_usd"
-        if sp.get("active_s", 0) >= L.active_seconds:
-            return "budget_time"
-        if deps.ledger.n_trials(deps.snapshot.snapshot_id) >= L.max_trials_per_snapshot:
-            return "trial_cap"
-        return None
+        return s.get("halt_reason") or budget_reason(deps, s)
 
     def log(s: ResearchState, frm: str, to: str, why: str = "") -> str:
         deps.events.emit("route", frm=frm, to=to, why=why, run_id=s.get("run_id"))

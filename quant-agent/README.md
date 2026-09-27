@@ -5,7 +5,7 @@
 ```bash
 cd quant-agent
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest -q                                   # 25 個測試
+.venv/bin/python -m pytest -q                                   # 38 個測試
 .venv/bin/python -m quantloop.run --run-dir runs/demo --approve # 離線示範（stub LLM + 合成資料）
 ```
 
@@ -37,16 +37,18 @@ from quantloop.llm import LLMClient, LangChainBackend
 from quantloop.prompts import VERSION
 from quantloop.run import make_deps, checkpointer_for
 from quantloop.graph import build_graph
+from quantloop.safety.sandbox import DockerSandbox
 
 cfg = Config()   # 先把 cfg.pricing 換成實際單價
 backend = LangChainBackend({"strong": ChatAnthropic(model="..."), "cheap": ChatAnthropic(model="...")})
 deps = make_deps("runs/real", cfg, snapshot=my_snapshot,   # data.make_snapshot(真實 OHLCV + funding)
-                 llm=LLMClient(backend, cfg.pricing.table, VERSION))
+                 llm=LLMClient(backend, cfg.pricing.table, VERSION),
+                 sandbox=DockerSandbox(image="your-registry/backtest-sandbox@sha256:..."))
 app = build_graph(deps, checkpointer_for(deps.run_dir))
 ```
 
 上線研究前還要做三件事：
-- 把 `SubprocessSandbox` 換成 `DockerSandbox`。子進程版本不隔離網路。
+- 用 `DockerSandbox`（映像檔只含 python、numpy、pandas，並以 digest 鎖定版本）。傳入真實 LLM 卻沒指定沙盒時，`make_deps` 會直接拒絕，因為子進程版本不隔離網路。
 - 資料用真實的交易所 OHLCV 和歷史資金費率，並且處理缺漏的 K 線、統一使用 UTC 的 open time。
 - 設定每筆交易的實際成本。
 

@@ -28,8 +28,13 @@ from .stub import StubBackend
 
 
 def make_deps(run_dir: str | Path, cfg: Config | None = None, snapshot: Snapshot | None = None,
-              llm: LLMClient | None = None, sandbox=None) -> Deps:
+              llm: LLMClient | None = None, sandbox=None, allow_unsafe_local_sandbox: bool = False) -> Deps:
+    """`SubprocessSandbox` does not isolate network or filesystem. It is only the default
+    for the offline stub (whose code we wrote); real LLM output must run in `DockerSandbox`."""
     cfg = cfg or Config()
+    if llm is not None and sandbox is None and not allow_unsafe_local_sandbox:
+        raise ValueError("real LLM output needs an isolating sandbox: pass sandbox=DockerSandbox(image=...) "
+                         "or allow_unsafe_local_sandbox=True for local experiments")
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     events = EventLog(run_dir / "events.jsonl")
@@ -66,6 +71,9 @@ def main() -> None:
     config = {"configurable": {"thread_id": run_id}, "recursion_limit": 500}
 
     snap = app.get_state(config)
+    if snap.values.get("report") and not snap.next:
+        print(f"run {run_id} already finished; see {deps.run_dir}/report_{run_id}.json")
+        return
     result = app.invoke({"run_id": run_id} if not snap.next else None, config)
     while "__interrupt__" in result:
         packet = result["__interrupt__"][0].value
@@ -81,7 +89,7 @@ def main() -> None:
 
     rep = result["report"]
     print("\n=== REPORT ===")
-    print(json.dumps({k: rep[k] for k in ("run_id", "halt_reason", "n_trials_on_snapshot", "eligible",
+    print(json.dumps({k: rep[k] for k in ("run_id", "stop_reason", "halt_reason", "final_threshold", "n_trials_on_snapshot", "eligible",
                                           "finalists", "oos", "champion", "lockbox", "review",
                                           "reflection_arms", "reflection_lift", "lessons", "spent",
                                           "threshold_curve")}, indent=2, default=str))

@@ -36,6 +36,24 @@ def test_static_rejects(snippet, cls):
     assert ast_rules.check(code, 4, 16).error_class == cls
 
 
+@pytest.mark.parametrize("snippet", [
+    'pd.read_table("/etc/passwd")', 'df["close"].to_numpy().tofile("x")', 'np.fromfile("x")',
+    'np.savetxt("x", [1])', 'pd.io.common', 'np.lib', 'np.random.rand(3)', 'df.query("close > 0")',
+])
+def test_static_blocks_io_and_module_escapes(snippet):
+    code = GOOD.replace("    return raw.clip(-1, 1)", f"    _x = {snippet}\n    return raw.clip(-1, 1)")
+    assert ast_rules.check(code, 4, 16).error_class == "E_FORBIDDEN"
+
+
+def test_static_blocks_monkey_patching_and_submodule_imports():
+    patched = GOOD.replace("PARAM_SPACE", "np.isclose = abs\nPARAM_SPACE", 1)
+    assert ast_rules.check(patched, 4, 16).error_class == "E_FORBIDDEN"
+    assert ast_rules.check("import numpy.lib\n" + GOOD, 4, 16).error_class == "E_IMPORT"
+    assert ast_rules.check("from os import system\n" + GOOD, 4, 16).error_class == "E_IMPORT"
+    mixed = GOOD.replace('"fast": [12, 24, 48]', '"fast": [12, None, [1]]')
+    assert ast_rules.check(mixed, 4, 16).error_class == "E_INTERFACE"
+
+
 def test_static_rejects_imports_and_big_grids():
     assert ast_rules.check("import os\n" + GOOD, 4, 16).error_class == "E_IMPORT"
     big = GOOD.replace('"fast": [12, 24, 48]', '"fast": [1, 2, 3, 4, 5, 6]')
@@ -60,6 +78,34 @@ def test_truncation_invariance_catches_whole_sample_stats(frame):
     grid = ast_rules.expand_grid(ast_rules.check(code, 4, 16).param_space)
     res = SubprocessSandbox(60).run(code, frame, grid)
     assert res.error_class == "E_LOOKAHEAD_DYNAMIC"       # ...the invariance test does
+
+
+def test_invariance_checks_every_param_combo(frame):
+    # only one of four combos peeks ahead, via a computed negative period the AST cannot see
+    code = GOOD.replace('{"fast": [12, 24, 48], "slow": [96, 192, 336]}', '{"lag": [1, 2, 3, -1]}').replace(
+        """    c = df["close"]
+    fast = c.ewm(span=params["fast"], adjust=False).mean()
+    slow = c.ewm(span=params["slow"], adjust=False).mean()
+    raw = np.sign(fast - slow)""", """    r = df["close"].pct_change()
+    raw = np.sign(r.shift(0 + params["lag"])).fillna(0.0)""")
+    rep = ast_rules.check(code, 4, 16)
+    assert rep.ok
+    grid = ast_rules.expand_grid(rep.param_space)
+    res = SubprocessSandbox(60).run(code, frame, grid)
+    assert res.error_class == "E_LOOKAHEAD_DYNAMIC"
+    assert grid[res.detail["combo"]] == {"lag": -1}
+
+
+def test_sandbox_files_are_readable_by_unprivileged_container_user(tmp_path, frame):
+    from quantloop.safety.sandbox import DockerSandbox, _prepare
+    work = tmp_path / "w"
+    work.mkdir(mode=0o700)
+    _prepare(work, GOOD, frame.iloc[:100], [{"fast": 12, "slow": 96}], [50, 99])
+    assert oct(work.stat().st_mode)[-3:] == "755"
+    assert oct((work / "harness.py").stat().st_mode)[-3:] == "644"
+    assert oct((work / "out").stat().st_mode)[-3:] == "777"
+    cmd = DockerSandbox("img@sha256:abc").command(work, "n1")
+    assert {"--network", "none", "--read-only", "--cap-drop", "ALL"} <= set(cmd)
 
 
 def test_sandbox_classifies_runtime_errors_and_timeouts(frame):
@@ -115,6 +161,22 @@ def test_dsr_penalises_more_trials():
     curve = [stats.required_annual_sr(n, 20000, 8760) for n in (1, 5, 20, 40)]
     assert curve == sorted(curve)
     assert stats.expected_max_sr(1, 1.0) == 0.0
+
+
+def test_oos_gate_needs_real_evidence():
+    # 1.2 years of hourly OOS: SR 0.5 is indistinguishable from noise, SR 2.5 is not
+    n = int(1.2 * 8760)
+    alpha_each = Config().oos_gate.alpha / 2
+    weak = stats.psr(stats.per_bar(0.5, 8760), 0.0, n, 0, 3)
+    strong = stats.psr(stats.per_bar(2.5, 8760), 0.0, n, 0, 3)
+    assert weak < 1 - alpha_each < strong
+
+
+def test_fold_boundary_param_switch_pays_turnover():
+    pnl = np.zeros((10, 2))
+    pos = np.array([[1.0] * 10, [-1.0] * 10]).T
+    out = engine._stitch(pnl, pos, [(0, 5, 0), (5, 10, 1)], rate=0.001)
+    assert np.isclose(out[5], -2 * 0.001)            # flipping +1 -> -1 at the boundary
 
 
 def test_seed_is_deterministic_across_processes():

@@ -59,12 +59,13 @@ def dsr(sr: float, n_obs: int, skew: float, kurt: float,
 
 
 def required_annual_sr(n_trials: int, n_obs: int, bars_per_year: int,
-                       min_dsr: float = 0.95) -> float:
+                       min_dsr: float = 0.95, var_sr: float | None = None) -> float:
     """Threshold curve: annual SR needed to pass DSR>=min_dsr at n_trials (normal returns).
 
-    Published at run start so that humans know how strict the gate will get.
+    Published at run start so that humans know how strict the gate will get. Pass the
+    observed cross-trial variance when available: dispersed trials raise the bar a lot.
     """
-    var = 1.0 / (n_obs - 1)
+    var = var_sr if var_sr is not None else 1.0 / (n_obs - 1)
     sr0 = expected_max_sr(n_trials, var)
     sr = sr0 + _N.inv_cdf(min_dsr) / math.sqrt(n_obs - 1)
     return sr * math.sqrt(bars_per_year)

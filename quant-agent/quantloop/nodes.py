@@ -10,7 +10,6 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import math
 import re
 import time
 from dataclasses import dataclass
@@ -72,6 +71,17 @@ def node(deps: Deps, name: str):
     return deco
 
 
+def budget_reason(deps: Deps, state: ResearchState) -> str | None:
+    L, sp = deps.cfg.limits, (state.get("spent") or {})
+    if sp.get("usd", 0) >= L.usd:
+        return "budget_usd"
+    if sp.get("active_s", 0) >= L.active_seconds:
+        return "budget_time"
+    if deps.ledger.n_trials(deps.snapshot.snapshot_id) >= L.max_trials_per_snapshot:
+        return "trial_cap"
+    return None
+
+
 def remaining_usd(deps: Deps, state: ResearchState) -> float:
     return deps.cfg.limits.usd - (state.get("spent") or {}).get("usd", 0.0)
 
@@ -95,7 +105,9 @@ def build_nodes(deps: Deps) -> dict:
     @node(deps, "init_run")
     def init_run(state):
         n_obs = len(research) - cfg.wf.initial_train_bars
-        curve = {n: round(stats.required_annual_sr(n, n_obs, bpy, cfg.is_gate.min_dsr), 3)
+        prior = deps.ledger.trial_srs(deps.snapshot.snapshot_id)
+        var = stats.trial_variance(prior, n_obs)          # null floor until real trials exist
+        curve = {n: round(stats.required_annual_sr(n, n_obs, bpy, cfg.is_gate.min_dsr, var), 3)
                  for n in (1, 5, 10, 20, 40)}
         deps.events.emit("run_start", run_id=state["run_id"], snapshot=deps.snapshot.snapshot_id,
                          config=cfg.fingerprint(), threshold_curve=curve,
@@ -236,11 +248,12 @@ def build_nodes(deps: Deps) -> dict:
         v, idea = state["variant"], state["idea"]
         signals = deps.store.get_array(v["signals_ref"])
         grid = ast_rules.expand_grid(v["param_space"])
+        rate = engine.cost_rate(cfg.costs)
         pnl, pos = _grid_pnl(signals, research)
-        wf = engine.walk_forward(pnl, pos, cfg.wf, bpy)
+        wf = engine.walk_forward(pnl, pos, cfg.wf, bpy, rate)
         m = engine.metrics(wf.oof_pnl, wf.oof_pos, bpy)
         pnl_fee2, _ = _grid_pnl(signals, research, fee_mult=2.0)
-        pnl_delay, _ = _grid_pnl(signals, research, delay=1)
+        pnl_delay, pos_delay = _grid_pnl(signals, research, delay=1)
         oof, half = wf.oof_pnl, len(wf.oof_pnl) // 2
         vol = np.abs(research["close"].pct_change().to_numpy())[wf.oof_index]
         hi = vol > np.nanmedian(vol)
@@ -250,8 +263,8 @@ def build_nodes(deps: Deps) -> dict:
             "long_sharpe": m["long_sharpe"], "short_sharpe": m["short_sharpe"],
             "fold_sharpes": wf.fold_sharpes,
             "pos_fold_frac": f(np.mean([s > 0 for s in wf.fold_sharpes])),
-            "fee_x2_sharpe": f(engine.sharpe(wf.apply(pnl_fee2), bpy)),
-            "delay_sharpe": f(engine.sharpe(wf.apply(pnl_delay), bpy)),
+            "fee_x2_sharpe": f(engine.sharpe(wf.apply(pnl_fee2, pos, 2 * rate), bpy)),
+            "delay_sharpe": f(engine.sharpe(wf.apply(pnl_delay, pos_delay, rate), bpy)),
             "plateau_ratio": engine.plateau_ratio(pnl, grid, bpy),
             "first_half_sharpe": f(engine.sharpe(oof[:half], bpy)),
             "second_half_sharpe": f(engine.sharpe(oof[half:], bpy)),
@@ -354,8 +367,14 @@ def build_nodes(deps: Deps) -> dict:
         visible = context.visible_diagnostics(best["diag"])
         spent_total: dict = {}
         for _ in range(2):
-            out, spent = deps.llm.call("reflect", "strong", Reflection, prompts.REFLECT, payload,
-                                       remaining_usd(deps, state) - spent_total.get("usd", 0))
+            try:
+                out, spent = deps.llm.call("reflect", "strong", Reflection, prompts.REFLECT, payload,
+                                           remaining_usd(deps, state) - spent_total.get("usd", 0))
+            except HaltError as e:                       # keep the first call's cost on the books
+                for k, val in getattr(e, "spent", {}).items():
+                    spent_total[k] = spent_total.get(k, 0) + val
+                e.spent = spent_total
+                raise
             for k, val in spent.items():
                 spent_total[k] = spent_total.get(k, 0) + val
             problems = validate_reflection(out, visible, idea["changes"])
@@ -437,22 +456,20 @@ def build_nodes(deps: Deps) -> dict:
                 break
         order = deps.ledger.register_finalists(state["run_id"], [p["variant_id"] for p in picked])
         by_id = {p["variant_id"]: p for p in picked}
-        n_trials = len(srs)
-        var = stats.trial_variance(srs, int(np.mean([p["diag"]["n_obs"] for p in picked])) if picked else 2)
+        alpha_each = cfg.oos_gate.alpha / max(len(order), 1)          # Bonferroni over finalists
         oos_rows, champion = [], None
         for vid in order:
-            p = by_id[vid]
+            p = by_id.get(vid)
+            if p is None:                                             # frozen earlier in a previous attempt
+                continue
             prev = deps.ledger.oos_result(snap, vid)
             if prev is None:
                 seg = _segment_sharpe(p["code_ref"], p["diag"]["last_fold_params"], "oos")
                 if seg is None:
                     continue
-                sr_oos = seg[0]
-                years = (deps.snapshot.bounds["oos"][1] - deps.snapshot.bounds["oos"][0]) / bpy
-                se = math.sqrt((1 + 0.5 * sr_oos ** 2) / max(years, 1e-9))
-                is_deflated = p["diag"]["oof_sharpe"] - stats.expected_max_sr(n_trials, var) * math.sqrt(bpy)
-                bar = max(0.0, cfg.oos_gate.haircut * is_deflated - cfg.oos_gate.se_multiplier * se)
-                passed = sr_oos > 0 and sr_oos >= bar
+                sr_oos, mo = seg
+                p_skill = stats.psr(stats.per_bar(sr_oos, bpy), 0.0, mo["n_obs"], mo["skew"], mo["kurt"])
+                passed = p_skill >= 1.0 - alpha_each
                 try:
                     deps.ledger.record_oos(snap, vid, state["run_id"], sr_oos, passed, L.max_oos_per_snapshot)
                 except QuotaExceeded as e:
@@ -461,11 +478,20 @@ def build_nodes(deps: Deps) -> dict:
             else:
                 sr_oos, passed = prev
             oos_rows.append({"variant_id": vid, "oos_sharpe": f(sr_oos), "passed": passed})
-            if passed and champion is None:
+            if passed:
                 champion = {**p, "oos_sharpe": f(sr_oos)}         # first in pre-registered order
+                break                                             # do not spend OOS quota on the rest
+        n_obs = int(np.mean([e["diag"]["n_obs"] for e in state.get("eligible", [])])) if state.get("eligible") \
+            else len(research) - cfg.wf.initial_train_bars
+        var = stats.trial_variance(srs, n_obs)
+        final_curve = {"n_trials": len(srs), "required_is_sharpe": round(stats.required_annual_sr(
+            max(len(srs), 1), n_obs, bpy, cfg.is_gate.min_dsr, var), 3),
+            "trial_sr_dispersion_vs_null": round(var * (n_obs - 1), 2)}
         deps.events.emit("finalize", finalists=order, oos=oos_rows,
                          champion=champion and champion["variant_id"])
-        return {"finalists": order, "oos": oos_rows, "champion": champion}
+        stop = state.get("halt_reason") or budget_reason(deps, state) or "completed"
+        return {"finalists": order, "oos": oos_rows, "champion": champion, "stop_reason": stop,
+                "final_threshold": final_curve}
 
     @node(deps, "lockbox_eval")
     def lockbox_eval(state):
@@ -477,8 +503,10 @@ def build_nodes(deps: Deps) -> dict:
             return {"lockbox": {"status": "unavailable", "detail": "lockbox already spent on this snapshot "
                                                                    f"by {used['variant_id']}"}}
         seg = _segment_sharpe(ch["code_ref"], ch["diag"]["last_fold_params"], "lockbox")
+        if seg is None:                                  # do not burn the one-shot quota on an infra error
+            return {"lockbox": {"status": "error", "detail": "sandbox failed; lockbox not consumed"}}
         result = {"status": "evaluated", "sharpe": f(seg[0]), "max_dd": seg[1]["max_dd"],
-                  "n_trades": seg[1]["n_trades"]} if seg else {"status": "error"}
+                  "n_trades": seg[1]["n_trades"]}
         deps.ledger.record_lockbox(snap, ch["variant_id"], state["run_id"], result)
         return {"lockbox": {"variant_id": ch["variant_id"], **result}}
 
@@ -494,7 +522,8 @@ def build_nodes(deps: Deps) -> dict:
             "n_trials_on_snapshot": deps.ledger.n_trials(deps.snapshot.snapshot_id),
             "threshold_curve": state["threshold_curve"],
             "assumptions": {"fees": cfg.costs.taker_fee, "slippage": cfg.costs.slippage,
-                            "execution": "next bar open", "funding": "charged on funding bars"},
+                            "execution": "next bar open", "funding": "charged on the position held at settlement"},
+            "final_threshold": state.get("final_threshold"),
             "instructions": "Resume with {decision: approve|reject, reviewer, rationale(>=10 chars)}",
         }
         error = None
@@ -520,6 +549,7 @@ def build_nodes(deps: Deps) -> dict:
         rep = {
             "run_id": state["run_id"], "snapshot": deps.snapshot.snapshot_id, "config": cfg.fingerprint(),
             "halt_reason": state.get("halt_reason"), "halt_detail": state.get("halt_detail"),
+            "stop_reason": state.get("stop_reason"), "final_threshold": state.get("final_threshold"),
             "ideas": [a for a in state.get("attempts", []) if a.get("kind") == "idea"],
             "variants": variants, "threshold_curve": state.get("threshold_curve"),
             "n_trials_on_snapshot": deps.ledger.n_trials(deps.snapshot.snapshot_id),

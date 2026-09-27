@@ -163,7 +163,11 @@ class LLMClient:
         spent = {"usd": 0.0, "tokens_in": 0, "tokens_out": 0, "llm_calls": 0}
         feedback = ""
         for schema_attempt in range(2):
-            parsed, usage, stop = self._invoke_with_retry(tier, schema, system, user + feedback, max_output_tokens)
+            try:
+                parsed, usage, stop = self._invoke_with_retry(tier, schema, system, user + feedback,
+                                                              max_output_tokens)
+            except HaltError as e:
+                raise _with_spent(e, spent)
             cost = self._cost(tier, usage.input_tokens, usage.output_tokens)
             spent["usd"] += cost
             spent["tokens_in"] += usage.input_tokens
